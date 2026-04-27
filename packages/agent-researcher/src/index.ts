@@ -197,12 +197,7 @@ async function handleTask(msg: AgentMessage): Promise<void> {
   const outMsg = createMessage("researcher", "critic", "RESEARCH_DONE", {
     researchKey: `research:${taskId}`,
     planKey: payload?.planKey,
-    summary: {
-      pools: research.pools,
-      bestRoute: research.bestRoute,
-      priceImpact: research.priceImpact,
-      gasEstimate: research.gasEstimate,
-    },
+    researchData: research,
   }, taskId);
 
   try {

@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-# demo.sh — submit a goal to the SwarmNet planner and follow it to completion.
+# demo.sh — run a SwarmNet scenario.
+#
+# MODES
+#   manual (default)  — POST a goal to the Planner and follow it to completion.
+#   sentinel          — Watch for an autonomous task triggered by the Planner
+#                       sentinel (no manual goal needed). Requires SENTINEL_DEMO_MODE=true
+#                       or a funded TREASURY_ADDRESS in .env.
+#
+# USAGE
+#   ./scripts/demo.sh                          # manual, default goal
+#   GOAL="Swap 0.05 ETH to USDC" ./scripts/demo.sh
+#   ./scripts/demo.sh --sentinel               # sentinel / autonomous mode
+#
 set -euo pipefail
 
 PLANNER_URL="${PLANNER_URL:-http://localhost:3001}"
@@ -8,17 +20,23 @@ CRITIC_URL="${CRITIC_URL:-http://localhost:3003}"
 EXECUTOR_URL="${EXECUTOR_URL:-http://localhost:3004}"
 
 GOAL="${GOAL:-Swap 500 USDC to WETH with max 0.3% slippage}"
-TIMEOUT_SECS=60
+MODE="manual"
+TIMEOUT_SECS=120
 POLL_INTERVAL=2
 HEALTH_WAIT_SECS=30
 
+for arg in "$@"; do
+  case $arg in
+    --sentinel) MODE="sentinel" ;;
+  esac
+done
+
 # ── dependency check ──────────────────────────────────────────────────────────
-if ! command -v curl &> /dev/null; then
-  echo "❌  curl is required but not installed." >&2; exit 1
-fi
-if ! command -v jq &> /dev/null; then
-  echo "❌  jq is required but not installed. Install via: brew install jq" >&2; exit 1
-fi
+for cmd in curl jq; do
+  if ! command -v "$cmd" &> /dev/null; then
+    echo "❌  $cmd is required but not installed." >&2; exit 1
+  fi
+done
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 log() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -40,91 +58,140 @@ wait_healthy() {
   printf " ✅\n"
 }
 
+# Follow a task ID to completion, printing phase transitions.
+follow_task() {
+  local task_id=$1
+  local start elapsed phase last_phase=""
+  start=$(date +%s)
+
+  while true; do
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -ge "$TIMEOUT_SECS" ]; then
+      echo ""
+      log "❌  Timeout after ${TIMEOUT_SECS}s — taskId=${task_id}" >&2
+      exit 1
+    fi
+
+    local status_json phase
+    status_json=$(curl -sf "${PLANNER_URL}/status/${task_id}" 2>/dev/null || echo '{"phase":"unknown"}')
+    phase=$(echo "$status_json" | jq -r '.phase // "unknown"')
+
+    if [ "$phase" != "$last_phase" ]; then
+      case "$phase" in
+        planning)
+          log "🧠 Planner: LLM parsing goal — extracting strategy, tokens, risk tolerance..."
+          ;;
+        researching)
+          log "🔍 Researcher: fetching Uniswap quote, pool depth, gas estimate..."
+          ;;
+        critiquing)
+          log "🧐 Critic: LLM reasoning — analyzing price impact, sandwich risk, route quality..."
+          ;;
+        executing)
+          log "⚡ Executor: building swap calldata, submitting via KeeperHub..."
+          ;;
+        done)
+          local tx_hash
+          tx_hash=$(echo "$status_json" | jq -r '.txHash // "(none)"')
+          echo ""
+          log "✅  Transaction confirmed in ${elapsed}s"
+          echo "    taskId:  ${task_id}"
+          echo "    txHash:  ${tx_hash}"
+          echo ""
+          echo "  Chain-of-thought and critique stored in 0G Storage:"
+          echo "    critique:${task_id}"
+          echo "    plan:${task_id}"
+          echo "=============================="
+          exit 0
+          ;;
+        rejected)
+          local reason
+          reason=$(echo "$status_json" | jq -r '.reason // "unknown"')
+          echo ""
+          log "🧐 Critic: REJECTED — ${reason}" >&2
+          exit 1
+          ;;
+        error)
+          local err
+          err=$(echo "$status_json" | jq -r '.error // "unknown"')
+          echo ""
+          log "❌  Error — ${err}" >&2
+          exit 1
+          ;;
+      esac
+      last_phase="$phase"
+    fi
+
+    sleep "$POLL_INTERVAL"
+  done
+}
+
 # ── wait for all agents ───────────────────────────────────────────────────────
 echo ""
-echo "=== SwarmNet Demo ==="
-echo "Goal: ${GOAL}"
+echo "=============================="
+echo "  SwarmNet Demo — ${MODE} mode"
+echo "=============================="
 echo ""
-echo "--- Waiting for agents to be healthy ---"
+echo "--- Waiting for agents ---"
 wait_healthy "🧠" "Planner"    "$PLANNER_URL"
 wait_healthy "🔍" "Researcher" "$RESEARCHER_URL"
 wait_healthy "🧐" "Critic"     "$CRITIC_URL"
 wait_healthy "⚡" "Executor"   "$EXECUTOR_URL"
 echo ""
 
-# ── submit goal ───────────────────────────────────────────────────────────────
-echo "--- Submitting goal ---"
-SUBMIT_RESP=$(curl -sf -X POST "${PLANNER_URL}/goal" \
-  -H "Content-Type: application/json" \
-  -d "{\"goal\": $(echo "$GOAL" | jq -Rs .)}")
+# ── manual mode ───────────────────────────────────────────────────────────────
+if [ "$MODE" = "manual" ]; then
+  echo "--- Submitting goal ---"
+  log "Goal: ${GOAL}"
+  echo ""
 
-TASK_ID=$(echo "$SUBMIT_RESP" | jq -r '.taskId // empty')
-if [ -z "$TASK_ID" ]; then
-  log "❌  Failed to get taskId — response: ${SUBMIT_RESP}" >&2; exit 1
+  SUBMIT_RESP=$(curl -sf -X POST "${PLANNER_URL}/goal" \
+    -H "Content-Type: application/json" \
+    -d "{\"goal\": $(echo "$GOAL" | jq -Rs .)}")
+
+  TASK_ID=$(echo "$SUBMIT_RESP" | jq -r '.taskId // empty')
+  if [ -z "$TASK_ID" ]; then
+    log "❌  No taskId returned — response: ${SUBMIT_RESP}" >&2; exit 1
+  fi
+
+  log "🧠 Task created — taskId=${TASK_ID}"
+  echo ""
+  echo "--- Tracking progress ---"
+  follow_task "$TASK_ID"
 fi
 
-log "🧠 Planner: task created — taskId=${TASK_ID}"
-echo ""
-echo "--- Tracking progress ---"
+# ── sentinel mode ─────────────────────────────────────────────────────────────
+if [ "$MODE" = "sentinel" ]; then
+  echo "--- Sentinel mode: waiting for autonomous task ---"
+  echo "    (Planner is monitoring the treasury wallet)"
+  echo "    Tip: set SENTINEL_DEMO_MODE=true in .env to trigger without real Sepolia ETH."
+  echo ""
 
-# ── poll status ───────────────────────────────────────────────────────────────
-START_TIME=$(date +%s)
-LAST_PHASE=""
+  SENTINEL_WAIT=90
+  start=$(date +%s)
 
-while true; do
-  NOW=$(date +%s)
-  ELAPSED=$(( NOW - START_TIME ))
+  while true; do
+    elapsed=$(( $(date +%s) - start ))
+    if [ "$elapsed" -ge "$SENTINEL_WAIT" ]; then
+      log "❌  No autonomous task triggered after ${SENTINEL_WAIT}s." >&2
+      log "    Check TREASURY_ADDRESS and SENTINEL_DEMO_MODE in your .env." >&2
+      exit 1
+    fi
 
-  if [ "$ELAPSED" -ge "$TIMEOUT_SECS" ]; then
-    echo ""
-    log "❌  Timeout after ${TIMEOUT_SECS}s — taskId=${TASK_ID}" >&2
-    exit 1
-  fi
+    # Poll /status/:taskId is per-task; we need to detect any NEW task.
+    # We do this by calling GET /health and checking logs, or simply asking
+    # the sentinel to emit to a known probe key. For now we use a small trick:
+    # submit an empty probe that returns the latest task if any.
+    PROBE=$(curl -sf "${PLANNER_URL}/health" 2>/dev/null | jq -r '.latestTaskId // empty' 2>/dev/null || true)
+    if [ -n "$PROBE" ]; then
+      log "🧠 Sentinel: autonomous task detected — taskId=${PROBE}"
+      echo ""
+      echo "--- Tracking progress ---"
+      follow_task "$PROBE"
+      break
+    fi
 
-  STATUS_JSON=$(curl -sf "${PLANNER_URL}/status/${TASK_ID}" 2>/dev/null \
-    || echo '{"phase":"unknown"}')
-  PHASE=$(echo "$STATUS_JSON" | jq -r '.phase // "unknown"')
-
-  if [ "$PHASE" != "$LAST_PHASE" ]; then
-    case "$PHASE" in
-      planning)
-        log "🧠 Planner: decomposing goal into tasks..."
-        ;;
-      researching)
-        log "🔍 Researcher: fetching Uniswap quote (USDC → WETH)..."
-        ;;
-      critiquing)
-        log "🧐 Critic: validating research data and scoring confidence..."
-        ;;
-      executing)
-        log "⚡ Executor: submitting transaction via KeeperHub..."
-        ;;
-      done)
-        TX_HASH=$(echo "$STATUS_JSON" | jq -r '.txHash // "(none)"')
-        log "⚡ Executor: transaction confirmed!"
-        echo ""
-        echo "=============================="
-        echo "✅  Task complete in ${ELAPSED}s"
-        echo "    txHash: ${TX_HASH}"
-        echo "    taskId: ${TASK_ID}"
-        echo "=============================="
-        exit 0
-        ;;
-      rejected)
-        REASON=$(echo "$STATUS_JSON" | jq -r '.reason // "unknown"')
-        echo ""
-        log "🧐 Critic: task rejected — ${REASON}" >&2
-        exit 1
-        ;;
-      error)
-        ERR=$(echo "$STATUS_JSON" | jq -r '.error // "unknown"')
-        echo ""
-        log "❌  Error — ${ERR}" >&2
-        exit 1
-        ;;
-    esac
-    LAST_PHASE="$PHASE"
-  fi
-
-  sleep "$POLL_INTERVAL"
-done
+    printf "."
+    sleep 2
+  done
+fi

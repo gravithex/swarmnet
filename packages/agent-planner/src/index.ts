@@ -3,12 +3,16 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import {
   AXLClient,
   MemoryStore,
+  createLLMClient,
+  LLM_MODEL,
+  readWalletSnapshot,
   createMessage,
   log,
   toErrMsg,
   type AgentMessage,
   type AgentRole,
   type PlanStep,
+  type WalletSnapshot,
 } from "@swarmnet/shared";
 
 const AGENT: AgentRole = "planner";
@@ -23,6 +27,20 @@ const ZEROG_RPC_URL = process.env.ZEROG_RPC_URL ?? "";
 const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
 const ZEROG_STREAM_ID = process.env.ZEROG_STREAM_ID ?? "";
+
+// ── sentinel config ───────────────────────────────────────────────────────────
+const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS ?? "";
+// How often the sentinel polls the treasury (ms). Default: 5 min.
+const SENTINEL_INTERVAL_MS = Number(process.env.SENTINEL_INTERVAL_MS ?? "300000");
+// Inject a fake snapshot instead of reading chain — useful when testnet ETH is scarce.
+const SENTINEL_DEMO_MODE = process.env.SENTINEL_DEMO_MODE === "true";
+
+// Sepolia token addresses the sentinel tracks.
+const WATCHED_TOKENS = [
+  { symbol: "WETH", address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14", decimals: 18 },
+  { symbol: "USDC", address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", decimals: 6 },
+  { symbol: "UNI", address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18 },
+];
 
 // ── task status (in-memory — drives GET /status/:taskId) ─────────────────────
 type TaskPhase =
@@ -53,27 +71,77 @@ const memory = new MemoryStore({
   streamId: ZEROG_STREAM_ID,
 });
 
-// ── plan decomposition ────────────────────────────────────────────────────────
-// Produces the four canonical phases: RESEARCH → VALIDATE → DECIDE → EXECUTE.
-function decompose(goal: string): PlanStep[] {
+// ── LLM goal planning ─────────────────────────────────────────────────────────
+interface GoalContext {
+  strategyType: string;
+  tokenIn: string;
+  tokenOut: string;
+  amountDescription: string;
+  riskTolerance: "low" | "medium" | "high";
+  maxSlippagePct: number;
+  rationale: string;
+  steps: Array<{ phase: string; instruction: string }>;
+}
+
+async function planWithLLM(goal: string, taskId: string): Promise<GoalContext> {
+  const llm = createLLMClient();
+  const completion = await llm.chat.completions.create({
+    model: LLM_MODEL,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `You are the Planner agent of a DeFi treasury management swarm.
+Your job is to parse a natural-language goal and produce a structured execution plan.
+
+ALWAYS respond with valid JSON matching exactly this schema:
+{
+  "strategyType": "swap" | "yield" | "rebalance" | "other",
+  "tokenIn": "symbol or address of input token",
+  "tokenOut": "symbol or address of output token",
+  "amountDescription": "human-readable amount (e.g. '1 ETH', '500 USDC')",
+  "riskTolerance": "low" | "medium" | "high",
+  "maxSlippagePct": <number between 0.1 and 5.0>,
+  "rationale": "one-paragraph explanation of the strategy and why it makes sense",
+  "steps": [
+    { "phase": "RESEARCH", "instruction": "what the researcher should fetch" },
+    { "phase": "CRITIQUE", "instruction": "what the critic should check" },
+    { "phase": "EXECUTE", "instruction": "what the executor should do" }
+  ]
+}`,
+      },
+      {
+        role: "user",
+        content: `Parse this DeFi goal and produce a structured plan:\n"${goal}"`,
+      },
+    ],
+  });
+
+  const raw = completion.choices[0]?.message?.content ?? "{}";
+  log(AGENT, "info", `LLM plan: ${raw}`, taskId);
+  return JSON.parse(raw) as GoalContext;
+}
+
+function buildSteps(ctx: GoalContext): PlanStep[] {
+  const instructions = Object.fromEntries(ctx.steps.map(s => [s.phase, s.instruction]));
   return [
     {
       id: randomUUID(),
-      description: `Research DeFi market data and conditions for: ${goal}`,
+      description: instructions["RESEARCH"] ?? `Fetch market data for ${ctx.tokenIn}→${ctx.tokenOut}`,
       assignedTo: "researcher",
       dependsOn: [],
       status: "pending",
     },
     {
       id: randomUUID(),
-      description: `Validate research findings and score confidence`,
+      description: instructions["CRITIQUE"] ?? `Validate findings — maxSlippage ${ctx.maxSlippagePct}%, riskTolerance ${ctx.riskTolerance}`,
       assignedTo: "critic",
       dependsOn: [],
       status: "pending",
     },
     {
       id: randomUUID(),
-      description: `Execute approved transactions for: ${goal}`,
+      description: instructions["EXECUTE"] ?? `Execute ${ctx.strategyType} for ${ctx.amountDescription}`,
       assignedTo: "executor",
       dependsOn: [],
       status: "pending",
@@ -89,10 +157,30 @@ async function handleGoal(goal: string): Promise<string> {
 
   taskStatus.set(taskId, { taskId, goal, phase: "planning", createdAt: now, updatedAt: now });
 
-  const steps = decompose(goal);
+  // LLM parses and enriches the goal into a structured context.
+  let goalContext: GoalContext;
+  try {
+    goalContext = await planWithLLM(goal, taskId);
+    log(AGENT, "info", `Strategy: ${goalContext.strategyType} ${goalContext.tokenIn}→${goalContext.tokenOut} risk=${goalContext.riskTolerance}`, taskId);
+  } catch (err) {
+    log(AGENT, "warn", `LLM planning failed, falling back to defaults: ${toErrMsg(err)}`, taskId);
+    goalContext = {
+      strategyType: "swap",
+      tokenIn: "ETH",
+      tokenOut: "USDC",
+      amountDescription: goal,
+      riskTolerance: "medium",
+      maxSlippagePct: 0.5,
+      rationale: goal,
+      steps: [],
+    };
+  }
+
+  const steps = buildSteps(goalContext);
   const plan = {
     taskId,
     goal,
+    goalContext,
     steps,
     createdAt: now,
     status: "pending" as const,
@@ -112,6 +200,7 @@ async function handleGoal(goal: string): Promise<string> {
 
   const msg = createMessage("planner", "researcher", "TASK", {
     goal,
+    goalContext,
     steps,
     planKey: `plan:${taskId}`,
   }, taskId);
@@ -216,8 +305,11 @@ function startHttp(): void {
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       if (req.method === "GET" && req.url === "/health") {
+        // Include the most recently created taskId so the demo script can
+        // detect autonomous sentinel tasks without a separate endpoint.
+        const latestTaskId = [...taskStatus.keys()].at(-1) ?? null;
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok", agent: AGENT }));
+        res.end(JSON.stringify({ status: "ok", agent: AGENT, latestTaskId }));
         return;
       }
 
@@ -266,6 +358,132 @@ function startHttp(): void {
   });
 }
 
+// ── sentinel ──────────────────────────────────────────────────────────────────
+interface SentinelDecision {
+  shouldAct: boolean;
+  goal: string;
+  rationale: string;
+  urgency: "low" | "medium" | "high";
+}
+
+async function evaluateWithLLM(snapshot: WalletSnapshot): Promise<SentinelDecision> {
+  const llm = createLLMClient();
+  const completion = await llm.chat.completions.create({
+    model: LLM_MODEL,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `You are the autonomous treasury Planner of a DeFi swarm on Ethereum Sepolia testnet.
+You monitor a treasury wallet and decide proactively if a DeFi action is needed.
+
+Consider acting when:
+- ETH balance > 0.01 ETH and there is a yield or swap opportunity
+- A token position is unbalanced (e.g. too much idle USDC, no WETH exposure)
+- A token was received and should be put to work
+
+Do NOT act when:
+- All balances are near zero (< 0.001 ETH equivalent)
+- A task is already in progress (you will be told)
+- The urgency is low and you acted recently
+
+ALWAYS respond with valid JSON:
+{
+  "shouldAct": true | false,
+  "goal": "natural-language goal string to pass to the swarm (empty string if shouldAct=false)",
+  "rationale": "one sentence explaining why you are or are not acting",
+  "urgency": "low" | "medium" | "high"
+}`,
+      },
+      {
+        role: "user",
+        content: `Current treasury snapshot:\n${JSON.stringify(snapshot, null, 2)}`,
+      },
+    ],
+  });
+
+  const raw = completion.choices[0]?.message?.content ?? "{}";
+  const parsed = JSON.parse(raw) as Partial<SentinelDecision>;
+  return {
+    shouldAct: parsed.shouldAct === true,
+    goal: typeof parsed.goal === "string" ? parsed.goal : "",
+    rationale: parsed.rationale ?? "",
+    urgency: (["low", "medium", "high"] as const).includes(parsed.urgency as "low")
+      ? (parsed.urgency as "low" | "medium" | "high")
+      : "low",
+  };
+}
+
+function hasActiveTask(): boolean {
+  for (const s of taskStatus.values()) {
+    if (!["done", "rejected", "error"].includes(s.phase)) return true;
+  }
+  return false;
+}
+
+async function sentinelTick(): Promise<void> {
+  if (!TREASURY_ADDRESS) return;
+
+  if (hasActiveTask()) {
+    log(AGENT, "info", "Sentinel: skipping tick — task already in progress");
+    return;
+  }
+
+  let snapshot: WalletSnapshot;
+  if (SENTINEL_DEMO_MODE) {
+    snapshot = {
+      address: TREASURY_ADDRESS,
+      ethBalanceEth: "0.15",
+      tokens: [
+        { symbol: "USDC", address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", decimals: 6, balance: "150.00" },
+        { symbol: "UNI",  address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18, balance: "10.00" },
+      ],
+      capturedAt: Date.now(),
+    };
+    log(AGENT, "info", "Sentinel: using demo snapshot (SENTINEL_DEMO_MODE=true)");
+  } else {
+    if (!ZEROG_RPC_URL) return;
+    try {
+      snapshot = await readWalletSnapshot(ZEROG_RPC_URL, TREASURY_ADDRESS, WATCHED_TOKENS);
+    } catch (err) {
+      log(AGENT, "warn", `Sentinel: wallet read failed — ${toErrMsg(err)}`);
+      return;
+    }
+  }
+
+  const tokenSummary = snapshot.tokens.map(t => `${t.symbol}=${t.balance}`).join(", ") || "none";
+  log(AGENT, "info", `Sentinel: ETH=${snapshot.ethBalanceEth} tokens=[${tokenSummary}]`);
+
+  let decision: SentinelDecision;
+  try {
+    decision = await evaluateWithLLM(snapshot);
+    log(AGENT, "info", `Sentinel: shouldAct=${decision.shouldAct} urgency=${decision.urgency} rationale="${decision.rationale}"`);
+  } catch (err) {
+    log(AGENT, "warn", `Sentinel: LLM evaluation failed — ${toErrMsg(err)}`);
+    return;
+  }
+
+  if (decision.shouldAct && decision.goal) {
+    log(AGENT, "info", `Sentinel: autonomously triggering goal — "${decision.goal}"`);
+    try {
+      await handleGoal(decision.goal);
+    } catch (err) {
+      log(AGENT, "error", `Sentinel: handleGoal failed — ${toErrMsg(err)}`);
+    }
+  }
+}
+
+function startSentinel(): void {
+  if (!TREASURY_ADDRESS) {
+    log(AGENT, "info", "Sentinel: TREASURY_ADDRESS not set — sentinel disabled");
+    return;
+  }
+  log(AGENT, "info", `Sentinel: monitoring ${TREASURY_ADDRESS} every ${SENTINEL_INTERVAL_MS / 1000}s`);
+  // Run first tick immediately, then on interval.
+  void sentinelTick();
+  setInterval(() => void sentinelTick(), SENTINEL_INTERVAL_MS);
+}
+
 // ── startup ───────────────────────────────────────────────────────────────────
 async function main(): Promise<void> {
   // Warn early about missing config rather than failing silently mid-operation.
@@ -298,6 +516,7 @@ async function main(): Promise<void> {
   log(AGENT, "info", "Subscribed to AXL message stream");
 
   startHttp();
+  startSentinel();
 
   const shutdown = (): void => {
     log(AGENT, "info", "Shutting down");

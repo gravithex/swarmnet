@@ -2,6 +2,8 @@ import { createServer } from "node:http";
 import {
   AXLClient,
   MemoryStore,
+  createLLMClient,
+  LLM_MODEL,
   createMessage,
   log,
   toErrMsg,
@@ -44,46 +46,63 @@ interface CritiqueData {
   scoredAt: number;
 }
 
-// ── validation ────────────────────────────────────────────────────────────────
-interface ValidationResult {
+// ── LLM critique ──────────────────────────────────────────────────────────────
+interface CritiqueResult {
   confidence: number;
-  reason: string;
+  verdict: "APPROVE" | "REJECT";
+  reasoning: string;
+  risks: string[];
+  chainOfThought: string;
 }
 
-function validate(research: ResearchData): ValidationResult {
-  let confidence = 0;
-  const failing: string[] = [];
+async function critiqueWithLLM(research: ResearchData, taskId: string): Promise<CritiqueResult> {
+  const llm = createLLMClient();
+  const completion = await llm.chat.completions.create({
+    model: LLM_MODEL,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `You are the Critic agent of a DeFi treasury management swarm running on Ethereum Sepolia.
+Your role is to protect the treasury by rigorously analyzing trade proposals before execution.
 
-  // priceImpact is a percentage string like "0.12" or "1.5".
-  const priceImpact = parseFloat(research.priceImpact);
-  if (!isNaN(priceImpact) && priceImpact < 0.5) {
-    confidence += 0.3;
-  } else {
-    failing.push(`priceImpact ${research.priceImpact}% exceeds 0.5%`);
-  }
+Evaluate the research data for:
+1. Price impact risk (>1% is dangerous for large trades)
+2. Liquidity depth (thin pools are vulnerable to sandwich attacks)
+3. Gas cost proportionality (gas should be <1% of trade value)
+4. Route quality (direct routes are safer than multi-hop)
+5. Slippage vs. market conditions
+6. Any red flags suggesting stale data or manipulation
 
-  // gasEstimate is the raw gas units string; gasEstimateUSD is the USD cost.
-  // We check gasEstimateUSD when available, otherwise treat as passing.
-  const gasUSD = research.gasEstimateUSD !== undefined
-    ? parseFloat(research.gasEstimateUSD)
-    : NaN;
-  const gasEthEquiv = isNaN(gasUSD)
-    ? null
-    : gasUSD / 3000; // rough ETH price denominator for sanity check
-  if (gasEthEquiv === null || gasEthEquiv < 0.01) {
-    confidence += 0.3;
-  } else {
-    failing.push(`gasEstimate USD ${research.gasEstimateUSD} exceeds ~0.01 ETH`);
-  }
+ALWAYS respond with valid JSON:
+{
+  "confidence": <number 0.0–1.0>,
+  "verdict": "APPROVE" | "REJECT",
+  "reasoning": "one clear sentence explaining the verdict",
+  "risks": ["risk1", "risk2", ...],
+  "chainOfThought": "step-by-step analysis showing your reasoning process"
+}
 
-  if (research.bestRoute && research.bestRoute.length > 0) {
-    confidence += 0.4;
-  } else {
-    failing.push("bestRoute is empty");
-  }
+Approve (confidence >= 0.7) only if the trade is safe and the data is trustworthy.`,
+      },
+      {
+        role: "user",
+        content: `Analyze this DeFi trade proposal and decide whether to approve execution:\n${JSON.stringify(research, null, 2)}`,
+      },
+    ],
+  });
 
-  const reason = failing.length > 0 ? failing.join("; ") : undefined;
-  return { confidence, reason: reason ?? "" };
+  const raw = completion.choices[0]?.message?.content ?? "{}";
+  log(AGENT, "info", `LLM critique raw: ${raw}`, taskId);
+  const parsed = JSON.parse(raw) as Partial<CritiqueResult>;
+
+  return {
+    confidence: typeof parsed.confidence === "number" ? Math.min(1, Math.max(0, parsed.confidence)) : 0,
+    verdict: parsed.verdict === "APPROVE" ? "APPROVE" : "REJECT",
+    reasoning: parsed.reasoning ?? "No reasoning provided",
+    risks: Array.isArray(parsed.risks) ? parsed.risks : [],
+    chainOfThought: parsed.chainOfThought ?? "",
+  };
 }
 
 // ── RESEARCH_DONE handler ─────────────────────────────────────────────────────
@@ -92,7 +111,7 @@ async function handleResearchDone(msg: AgentMessage): Promise<void> {
   const payload = msg.payload as {
     researchKey?: string;
     planKey?: string;
-    summary?: unknown;
+    researchData?: ResearchData;
   };
 
   const researchKey = payload?.researchKey ?? `research:${taskId}`;
@@ -106,49 +125,69 @@ async function handleResearchDone(msg: AgentMessage): Promise<void> {
     } catch { /* best-effort */ }
   }
 
-  // 1. Read research data from 0G Storage.
+  // 1. Read research data — prefer inline payload, fall back to 0G KV.
   let research: ResearchData;
   try {
-    const stored = await memory.get<ResearchData>(researchKey);
-    if (stored === null) {
-      throw new Error(`key ${researchKey} not found in 0G Storage`);
+    if (payload?.researchData) {
+      research = payload.researchData;
+      log(AGENT, "info", `Research loaded from AXL payload — priceImpact=${research.priceImpact}% gasEstimate=${research.gasEstimate}`, taskId);
+    } else {
+      const stored = await memory.get<ResearchData>(researchKey);
+      if (stored === null) throw new Error(`key ${researchKey} not found in 0G Storage`);
+      research = stored;
+      log(AGENT, "info", `Research loaded from 0G — priceImpact=${research.priceImpact}% gasEstimate=${research.gasEstimate}`, taskId);
     }
-    research = stored;
-    log(AGENT, "info", `Research loaded — priceImpact=${research.priceImpact}% gasEstimate=${research.gasEstimate}`, taskId);
   } catch (err) {
     log(AGENT, "error", `Failed to read research: ${toErrMsg(err)}`, taskId);
     await notifyError(taskId, toErrMsg(err));
     return;
   }
 
-  // 2. Run validation checks.
-  const { confidence, reason } = validate(research);
-  const verdict: "APPROVE" | "REJECT" = confidence >= 0.7 ? "APPROVE" : "REJECT";
-  log(AGENT, "info", `Validation complete — confidence=${confidence.toFixed(2)} verdict=${verdict}`, taskId);
+  // 2. LLM critique — full reasoning over the research data.
+  let critiqueResult: CritiqueResult;
+  try {
+    critiqueResult = await critiqueWithLLM(research, taskId);
+  } catch (err) {
+    log(AGENT, "error", `LLM critique failed: ${toErrMsg(err)}`, taskId);
+    await notifyError(taskId, `LLM critique failed: ${toErrMsg(err)}`);
+    return;
+  }
 
-  // 3. Persist critique to 0G Storage.
+  const { confidence, verdict, reasoning, risks, chainOfThought } = critiqueResult;
+  log(AGENT, "info", `LLM critique — confidence=${confidence.toFixed(2)} verdict=${verdict} reasoning="${reasoning}"`, taskId);
+  if (risks.length > 0) {
+    log(AGENT, "info", `Identified risks: ${risks.join(", ")}`, taskId);
+  }
+
+  // 3. Persist critique + chain-of-thought to 0G Storage.
   const critique: CritiqueData = {
     taskId,
     confidence,
     verdict,
-    ...(verdict === "REJECT" && reason ? { reason } : {}),
+    reason: reasoning,
     scoredAt: Date.now(),
   };
 
   try {
-    await memory.set(`critique:${taskId}`, critique);
-    log(AGENT, "info", `Critique written to 0G Storage at critique:${taskId}`, taskId);
+    await memory.set(`critique:${taskId}`, {
+      ...critique,
+      risks,
+      chainOfThought,
+    });
+    log(AGENT, "info", `Critique + CoT written to 0G Storage at critique:${taskId}`, taskId);
   } catch (err) {
     log(AGENT, "warn", `0G unavailable — critique not persisted: ${toErrMsg(err)}`, taskId);
   }
 
-  // 4. Append decision to shared log.
+  // 4. Append full decision log (with CoT) to 0G shared log.
   try {
     await memory.appendLog({
       event: verdict,
       taskId,
       confidence,
-      ...(reason ? { reason } : {}),
+      reasoning,
+      risks,
+      chainOfThought,
       ts: Date.now(),
     });
   } catch (err) {
@@ -166,6 +205,7 @@ async function handleResearchDone(msg: AgentMessage): Promise<void> {
       planKey: payload?.planKey,
       critiqueKey: `critique:${taskId}`,
       confidence,
+      researchData: research,
     }, taskId);
     try {
       await axl.sendMessage(EXECUTOR_PEER_ID, approveMsg);
@@ -183,11 +223,12 @@ async function handleResearchDone(msg: AgentMessage): Promise<void> {
       critiqueKey: `critique:${taskId}`,
       planKey: payload?.planKey,
       confidence,
-      reason,
+      reason: reasoning,
+      risks,
     }, taskId);
     try {
       await axl.sendMessage(PLANNER_PEER_ID, rejectMsg);
-      log(AGENT, "info", `REJECT dispatched to planner (peer=${PLANNER_PEER_ID}) reason="${reason}"`, taskId);
+      log(AGENT, "info", `REJECT dispatched to planner (peer=${PLANNER_PEER_ID}) reason="${reasoning}"`, taskId);
     } catch (err) {
       log(AGENT, "error", `AXL sendMessage failed: ${toErrMsg(err)}`, taskId);
     }
@@ -273,11 +314,7 @@ async function main(): Promise<void> {
   process.on("SIGINT", shutdown);
 }
 
-// main().catch((err: unknown) => {
-//   console.error(JSON.stringify({ agent: AGENT, level: "error", message: String(err) }));
-//   process.exit(1);
-// });
-
-memory.get("research:23198ee1-e833-4ca5-b102-1c0359e44788")
-  .then(val => console.log("result:", JSON.stringify(val, null, 2)))
-  .catch(err => console.error("error:", toErrMsg(err)));
+main().catch((err: unknown) => {
+  console.error(JSON.stringify({ agent: AGENT, level: "error", message: String(err) }));
+  process.exit(1);
+});

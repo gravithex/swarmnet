@@ -141,18 +141,24 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
     planKey?: string;
     critiqueKey?: string;
     confidence?: number;
+    researchData?: ResearchData;
   };
 
   const researchKey = payload?.researchKey ?? `research:${taskId}`;
   log(AGENT, "info", `Processing APPROVE — reading ${researchKey}`, taskId);
 
-  // 1. Load research data to get token/amount info for swap calldata.
+  // 1. Load research data — prefer inline payload, fall back to 0G KV.
   let research: ResearchData;
   try {
-    const stored = await memory.get<ResearchData>(researchKey);
-    if (stored === null) throw new Error(`key ${researchKey} not found in 0G Storage`);
-    research = stored;
-    log(AGENT, "info", `Research loaded — bestRoute="${research.bestRoute}"`, taskId);
+    if (payload?.researchData) {
+      research = payload.researchData;
+      log(AGENT, "info", `Research loaded from AXL payload — bestRoute="${research.bestRoute}"`, taskId);
+    } else {
+      const stored = await memory.get<ResearchData>(researchKey);
+      if (stored === null) throw new Error(`key ${researchKey} not found in 0G Storage`);
+      research = stored;
+      log(AGENT, "info", `Research loaded from 0G — bestRoute="${research.bestRoute}"`, taskId);
+    }
   } catch (err) {
     log(AGENT, "error", `Failed to read research: ${toErrMsg(err)}`, taskId);
     await notifyError(taskId, toErrMsg(err));
