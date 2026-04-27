@@ -1,0 +1,12 @@
+{
+  "PrivateKeyPath": "/app/keys/critic.pem",
+  "Peers": [
+    "tcp://axl-planner:7000",
+    "tcp://axl-researcher:7000",
+    "tcp://axl-executor:7000"
+  ],
+  "Listen": ["tcp://0.0.0.0:7000"],
+  "bridge_addr": "0.0.0.0",
+  "api_port": 9002,
+  "tcp_port": 7000
+}
