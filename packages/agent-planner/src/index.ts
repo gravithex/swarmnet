@@ -23,6 +23,7 @@ const RESEARCHER_PEER_ID = process.env.RESEARCHER_PEER_ID ?? "";
 const PLANNER_PORT = Number(process.env.PLANNER_PORT ?? "3001");
 
 const ZEROG_INDEXER_URL = process.env.ZEROG_INDEXER_URL ?? "";
+const ZEROG_KV_URL = process.env.ZEROG_KV_URL ?? "";
 const ZEROG_RPC_URL = process.env.ZEROG_RPC_URL ?? "";
 const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
@@ -65,6 +66,7 @@ const axl = new AXLClient(AXL_NODE_URL);
 
 const memory = new MemoryStore({
   indexerUrl: ZEROG_INDEXER_URL,
+  kvClientUrl: ZEROG_KV_URL,
   blockchainRpc: ZEROG_RPC_URL,
   privateKey: ZEROG_PRIVATE_KEY,
   flowAddress: ZEROG_FLOW_ADDRESS,
@@ -441,7 +443,7 @@ async function sentinelTick(): Promise<void> {
       ethBalanceEth: "0.15",
       tokens: [
         { symbol: "USDC", address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", decimals: 6, balance: "150.00" },
-        { symbol: "UNI",  address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18, balance: "10.00" },
+        { symbol: "UNI", address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18, balance: "10.00" },
       ],
       capturedAt: Date.now(),
     };

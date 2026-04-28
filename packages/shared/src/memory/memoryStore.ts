@@ -3,8 +3,10 @@ import { ethers } from "ethers";
 import { toErrMsg } from "../types/index.js";
 
 export interface MemoryStoreConfig {
-  /** 0G Indexer URL — used to discover live storage nodes for both reads and writes */
+  /** 0G Indexer URL — for writes */
   indexerUrl: string;
+  /** 0G KV Node URL — for reads */
+  kvClientUrl: string;
   /** EVM-compatible RPC URL, e.g. https://evmrpc-testnet.0g.ai */
   blockchainRpc: string;
   /** Hex private key (0x-prefixed) — must hold gas funds */
@@ -20,6 +22,7 @@ const LOG_KEY = "__log__";
 
 export class MemoryStore {
   private readonly indexerUrl: string;
+  private readonly kvClientUrl: string;
   private readonly blockchainRpc: string;
   private readonly privateKey: string;
   private readonly flowAddress: string;
@@ -30,6 +33,7 @@ export class MemoryStore {
 
   constructor(config: MemoryStoreConfig) {
     this.indexerUrl = config.indexerUrl;
+    this.kvClientUrl = config.kvClientUrl;
     this.blockchainRpc = config.blockchainRpc;
     this.privateKey = config.privateKey;
     this.flowAddress = config.flowAddress;
@@ -50,13 +54,9 @@ export class MemoryStore {
    */
   async get<T = unknown>(key: string): Promise<T | null> {
     try {
-      const indexer = new Indexer(this.indexerUrl);
-      const [nodes, err] = await indexer.selectNodes(1);
-      if (err) throw err;
-      if (nodes.length == 0) throw new Error("No 0G nodes available")
-      const kvClient = new KvClient(nodes[0].url);
+      const kvClient = new KvClient(this.kvClientUrl);
       const keyBytes = Uint8Array.from(Buffer.from(key, "utf-8"));
-      const val = await kvClient.getValue(this.streamId, keyBytes);
+      const val = await kvClient.getValue(this.streamId, ethers.encodeBase64(keyBytes));
       if (val === null) return null;
       const json = Buffer.from(val.data, "base64").toString("utf-8");
       return JSON.parse(json) as T;

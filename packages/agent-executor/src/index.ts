@@ -28,6 +28,7 @@ const SWAP_RECIPIENT = process.env.SWAP_RECIPIENT ?? "";
 const EXECUTOR_WALLET_ADDRESS = process.env.EXECUTOR_WALLET_ADDRESS ?? "";
 
 const ZEROG_INDEXER_URL = process.env.ZEROG_INDEXER_URL ?? "";
+const ZEROG_KV_URL = process.env.ZEROG_KV_URL ?? "";
 const ZEROG_RPC_URL = process.env.ZEROG_RPC_URL ?? "";
 const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
@@ -45,6 +46,7 @@ const axl = new AXLClient(AXL_NODE_URL);
 
 const memory = new MemoryStore({
   indexerUrl: ZEROG_INDEXER_URL,
+  kvClientUrl: ZEROG_KV_URL,
   blockchainRpc: ZEROG_RPC_URL,
   privateKey: ZEROG_PRIVATE_KEY,
   flowAddress: ZEROG_FLOW_ADDRESS,
