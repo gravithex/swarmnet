@@ -5,8 +5,8 @@ import { toErrMsg } from "../types/index.js";
 export interface MemoryStoreConfig {
   /** 0G Indexer URL — for writes */
   indexerUrl: string;
-  /** 0G KV Node URL — for reads */
-  kvClientUrl: string;
+  /** 0G KV Node URL — for reads. Optional: get() throws if not provided. */
+  kvClientUrl?: string;
   /** EVM-compatible RPC URL, e.g. https://evmrpc-testnet.0g.ai */
   blockchainRpc: string;
   /** Hex private key (0x-prefixed) — must hold gas funds */
@@ -22,7 +22,7 @@ const LOG_KEY = "__log__";
 
 export class MemoryStore {
   private readonly indexerUrl: string;
-  private readonly kvClientUrl: string;
+  private readonly kvClientUrl: string | undefined;
   private readonly blockchainRpc: string;
   private readonly privateKey: string;
   private readonly flowAddress: string;
@@ -53,10 +53,11 @@ export class MemoryStore {
    * Returns null when the key has never been written.
    */
   async get<T = unknown>(key: string): Promise<T | null> {
+    if (!this.kvClientUrl) throw new Error("MemoryStore.get: kvClientUrl not configured");
     try {
       const kvClient = new KvClient(this.kvClientUrl);
       const keyBytes = Uint8Array.from(Buffer.from(key, "utf-8"));
-      const val = await kvClient.getValue(this.streamId, ethers.encodeBase64(keyBytes));
+      const val = await kvClient.getValue(this.streamId, keyBytes);
       if (val === null) return null;
       const json = Buffer.from(val.data, "base64").toString("utf-8");
       return JSON.parse(json) as T;
@@ -99,22 +100,18 @@ export class MemoryStore {
   }
 
   /**
-   * Append an entry to the shared log stored under LOG_KEY.
-   * Read-then-write — safe for the single-writer-per-log pattern used here.
+   * Append an entry to the shared log.
+   * Each entry is written to a unique timestamped key — no KV read required.
    */
   async appendLog(entry: unknown): Promise<void> {
-    try {
-      const current = await this.getLog();
-      current.push(entry);
-      await this.set(LOG_KEY, current);
-    } catch (err) {
-      throw new Error(
-        `MemoryStore.appendLog failed: ${toErrMsg(err)}`
-      );
-    }
+    const key = `${LOG_KEY}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+    await this.set(key, entry);
   }
 
-  /** Return all entries in the shared log, oldest first. */
+  /**
+   * Return all log entries. Requires kvClientUrl to be set.
+   * Only usable when a KV node is available.
+   */
   async getLog<T = unknown>(): Promise<T[]> {
     try {
       return (await this.get<T[]>(LOG_KEY)) ?? [];

@@ -2,6 +2,8 @@ import { createServer } from "node:http";
 import {
   AXLClient,
   MemoryStore,
+  createLLMClient,
+  LLM_MODEL,
   createMessage,
   log,
   toErrMsg,
@@ -30,13 +32,6 @@ const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
 const ZEROG_STREAM_ID = process.env.ZEROG_STREAM_ID ?? "";
 
-// Canonical Sepolia token addresses.
-const USDC_SEPOLIA = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
-const WETH_SEPOLIA = "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14";
-const UNI_SEPOLIA = "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984";
-// 1 USDC — 6 decimals.
-const SWAP_AMOUNT = "1000000";
-
 // ── clients ───────────────────────────────────────────────────────────────────
 const axl = new AXLClient(AXL_NODE_URL);
 
@@ -48,6 +43,95 @@ const memory = new MemoryStore({
   flowAddress: ZEROG_FLOW_ADDRESS,
   streamId: ZEROG_STREAM_ID,
 });
+
+// ── Known Sepolia token registry ──────────────────────────────────────────────
+const SEPOLIA_TOKENS: Record<string, { address: string; decimals: number }> = {
+  WETH: { address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14", decimals: 18 },
+  USDC: { address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", decimals: 6 },
+  UNI:  { address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18 },
+};
+
+// ── LLM swap intent resolution ────────────────────────────────────────────────
+interface SwapParams {
+  tokenInSymbol: string;
+  tokenInAddress: string;
+  tokenInDecimals: number;
+  tokenOutSymbol: string;
+  tokenOutAddress: string;
+  tokenOutDecimals: number;
+  amountIn: string;      // base units (e.g. "75000000" for 75 USDC)
+  amountInHuman: string; // human-readable (e.g. "75")
+  rationale: string;
+}
+
+async function resolveSwapParams(goal: string, goalContext: unknown, taskId: string): Promise<SwapParams> {
+  const llm = createLLMClient();
+
+  const completion = await llm.chat.completions.create({
+    model: LLM_MODEL,
+    response_format: { type: "json_object" },
+    messages: [
+      {
+        role: "system",
+        content: `You are the Researcher agent of a DeFi swarm on Ethereum Sepolia testnet.
+Your job is to resolve a swap intent into exact on-chain parameters for the Uniswap API.
+
+Available tokens on Sepolia:
+${JSON.stringify(
+  Object.entries(SEPOLIA_TOKENS).map(([symbol, info]) => ({ symbol, ...info })),
+  null, 2
+)}
+
+RULES:
+- tokenIn/tokenOut must be chosen from the list above
+- amountIn must be in base units: multiply the human amount by 10^decimals, floor to integer, no decimal point
+  Example: 75 USDC (6 decimals) → "75000000"
+  Example: 10 UNI (18 decimals) → "10000000000000000000"
+- If goal says "half of X", compute floor(X / 2)
+- ETH and WETH are the same address on Sepolia — use WETH
+- Default fallback if unclear: 1 UNI → WETH
+
+ALWAYS respond with valid JSON:
+{
+  "tokenInSymbol": "USDC",
+  "tokenInAddress": "0x...",
+  "tokenInDecimals": 6,
+  "tokenOutSymbol": "WETH",
+  "tokenOutAddress": "0x...",
+  "tokenOutDecimals": 18,
+  "amountIn": "75000000",
+  "amountInHuman": "75",
+  "rationale": "one sentence explaining the resolved parameters"
+}`,
+      },
+      {
+        role: "user",
+        content: `Resolve the swap parameters for this goal:\n"${goal}"\n\nPlanner context: ${JSON.stringify(goalContext)}`,
+      },
+    ],
+  });
+
+  const raw = completion.choices[0]?.message?.content ?? "{}";
+  log(AGENT, "info", `LLM swap resolution: ${raw}`, taskId);
+  const parsed = JSON.parse(raw) as Partial<SwapParams>;
+
+  const fallbackIn = SEPOLIA_TOKENS["UNI"];
+  const fallbackOut = SEPOLIA_TOKENS["WETH"];
+  const resolvedIn = SEPOLIA_TOKENS[parsed.tokenInSymbol ?? ""] ?? fallbackIn;
+  const resolvedOut = SEPOLIA_TOKENS[parsed.tokenOutSymbol ?? ""] ?? fallbackOut;
+
+  return {
+    tokenInSymbol:    parsed.tokenInSymbol    ?? "UNI",
+    tokenInAddress:   parsed.tokenInAddress   ?? resolvedIn.address,
+    tokenInDecimals:  parsed.tokenInDecimals  ?? resolvedIn.decimals,
+    tokenOutSymbol:   parsed.tokenOutSymbol   ?? "WETH",
+    tokenOutAddress:  parsed.tokenOutAddress  ?? resolvedOut.address,
+    tokenOutDecimals: parsed.tokenOutDecimals ?? resolvedOut.decimals,
+    amountIn:         parsed.amountIn         ?? "1000000000000000000",
+    amountInHuman:    parsed.amountInHuman    ?? "1",
+    rationale:        parsed.rationale        ?? "Default swap parameters",
+  };
+}
 
 // ── Uniswap types ─────────────────────────────────────────────────────────────
 interface UniswapToken {
@@ -99,27 +183,27 @@ function isQuoteError(r: UniswapQuoteResponse): r is UniswapQuoteError {
 }
 
 // ── Uniswap fetch ─────────────────────────────────────────────────────────────
-async function fetchResearch(goal: string, taskId: string): Promise<ResearchData> {
-  log(AGENT, "info", `Fetching Uniswap quote USDC→WETH on chainId=${UNISWAP_CHAIN_ID}`, taskId);
+async function fetchResearch(goal: string, params: SwapParams, taskId: string): Promise<ResearchData> {
+  log(AGENT, "info", `Fetching Uniswap quote ${params.tokenInSymbol}→${params.tokenOutSymbol} amount=${params.amountInHuman} on chainId=${UNISWAP_CHAIN_ID}`, taskId);
 
   const body = {
     tokenInChainId: UNISWAP_CHAIN_ID,
-    tokenIn: UNI_SEPOLIA,
+    tokenIn: params.tokenInAddress,
     tokenOutChainId: UNISWAP_CHAIN_ID,
-    tokenOut: WETH_SEPOLIA,
+    tokenOut: params.tokenOutAddress,
     swapper: EXECUTOR_WALLET_ADDRESS,
-    amount: SWAP_AMOUNT,
+    amount: params.amountIn,
     type: "EXACT_INPUT",
-    routingPreference: 'BEST_PRICE',
+    routingPreference: "BEST_PRICE",
     slippageTolerance: 0.3,
-    protocols: ['V4', 'V3']
+    protocols: ["V4", "V3"],
   };
 
   const res = await fetch(UNISWAP_QUOTE_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      'x-universal-router-version': '2.0',
+      "x-universal-router-version": "2.0",
       "x-api-key": UNISWAP_API_KEY,
     },
     body: JSON.stringify(body),
@@ -134,7 +218,6 @@ async function fetchResearch(goal: string, taskId: string): Promise<ResearchData
 
   const { quote } = raw;
 
-  // Extract unique pool addresses from the nested route array.
   const pools = [
     ...new Set(
       quote.route
@@ -166,15 +249,35 @@ async function fetchResearch(goal: string, taskId: string): Promise<ResearchData
 // ── task handler ──────────────────────────────────────────────────────────────
 async function handleTask(msg: AgentMessage): Promise<void> {
   const { taskId } = msg;
-  const payload = msg.payload as { goal?: string; planKey?: string };
+  const payload = msg.payload as { goal?: string; planKey?: string; goalContext?: unknown };
   const goal = payload?.goal ?? "optimize DeFi yield";
 
   log(AGENT, "info", `Processing TASK — goal: "${goal}"`, taskId);
 
-  // 1. Fetch market data from Uniswap.
+  // Notify planner that research has started.
+  if (PLANNER_PEER_ID) {
+    try {
+      await axl.sendMessage(PLANNER_PEER_ID,
+        createMessage("researcher", "planner", "PROGRESS", { phase: "researching" }, taskId));
+    } catch { /* best-effort */ }
+  }
+
+  // 1. LLM resolves the goal into exact swap parameters.
+  let swapParams: SwapParams;
+  try {
+    swapParams = await resolveSwapParams(goal, payload?.goalContext, taskId);
+    log(AGENT, "info", `Swap params resolved — ${swapParams.tokenInSymbol}→${swapParams.tokenOutSymbol} amount=${swapParams.amountInHuman} (${swapParams.amountIn} base units)`, taskId);
+    log(AGENT, "info", `Resolution rationale: ${swapParams.rationale}`, taskId);
+  } catch (err) {
+    log(AGENT, "error", `LLM swap resolution failed: ${toErrMsg(err)}`, taskId);
+    await notifyError(taskId, `LLM swap resolution failed: ${toErrMsg(err)}`);
+    return;
+  }
+
+  // 2. Fetch market data from Uniswap using the resolved params.
   let research: ResearchData;
   try {
-    research = await fetchResearch(goal, taskId);
+    research = await fetchResearch(goal, swapParams, taskId);
     log(AGENT, "info", `Quote fetched — amountOut=${research.amountOut} priceImpact=${research.priceImpact}%`, taskId);
   } catch (err) {
     log(AGENT, "error", `Uniswap fetch failed: ${toErrMsg(err)}`, taskId);
@@ -182,7 +285,7 @@ async function handleTask(msg: AgentMessage): Promise<void> {
     return;
   }
 
-  // 2. Persist findings to 0G Storage.
+  // 3. Persist findings to 0G Storage.
   try {
     await memory.set(`research:${taskId}`, research);
     log(AGENT, "info", `Research written to 0G Storage at research:${taskId}`, taskId);
@@ -190,7 +293,7 @@ async function handleTask(msg: AgentMessage): Promise<void> {
     log(AGENT, "warn", `0G unavailable — research not persisted: ${toErrMsg(err)}`, taskId);
   }
 
-  // 3. Notify Critic via AXL.
+  // 4. Notify Critic via AXL.
   if (!CRITIC_PEER_ID) {
     log(AGENT, "warn", "CRITIC_PEER_ID not set — skipping AXL dispatch", taskId);
     return;
