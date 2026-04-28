@@ -17,11 +17,11 @@ const AXL_NODE_URL = process.env.AXL_NODE_URL ?? "http://localhost:9002";
 const PLANNER_PEER_ID = process.env.PLANNER_PEER_ID ?? "";
 const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? "3004");
 
-// KeeperHub workflow webhook — configure the workflow ID in .env.
 const KEEPERHUB_WORKFLOW_ID = process.env.KEEPERHUB_WORKFLOW_ID ?? "";
+const KEEPERHUB_USER_API_KEY = process.env.KEEPERHUB_USER_API_KEY ?? "";
+const KEEPERHUB_ORG_API_KEY = process.env.KEEPERHUB_ORG_API_KEY ?? "";
 const KEEPERHUB_BASE_URL = process.env.KEEPERHUB_BASE_URL ?? "https://app.keeperhub.com/api/workflows";
 
-// Recipient of swap output tokens.
 const SWAP_RECIPIENT = process.env.SWAP_RECIPIENT ?? "";
 const UNISWAP_CHAIN_ID = Number(process.env.UNISWAP_CHAIN_ID ?? "11155111");
 
@@ -31,6 +31,9 @@ const ZEROG_RPC_URL = process.env.ZEROG_RPC_URL ?? "";
 const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
 const ZEROG_STREAM_ID = process.env.ZEROG_STREAM_ID ?? "";
+
+const POLL_INTERVAL_MS = 5_000;
+const POLL_MAX_ATTEMPTS = 20;
 
 // ── clients ───────────────────────────────────────────────────────────────────
 const axl = new AXLClient(AXL_NODE_URL);
@@ -44,29 +47,48 @@ const memory = new MemoryStore({
   streamId: ZEROG_STREAM_ID,
 });
 
-// ── KeeperHub webhook ─────────────────────────────────────────────────────────
+// ── KeeperHub types ───────────────────────────────────────────────────────────
 interface WebhookPayload {
   taskId: string;
-  goal: string;
-  chainId: number;
-  recipient: string;
   tokenIn: ResearchData["tokenIn"];
   tokenOut: ResearchData["tokenOut"];
   amountIn: string;
-  amountOut: string;
-  bestRoute: string;
-  priceImpact: string;
-  gasEstimate: string;
-  gasEstimateUSD?: string;
+  fee: number;
+  recipient: string;
+  amountOutMinimum: number;
+  sqrtPriceLimitX96: number;
 }
 
-async function triggerWebhook(payload: WebhookPayload, taskId: string): Promise<void> {
+interface WebhookResponse {
+  executionId: string;
+  status: string;
+}
+
+type ExecutionStatus = "pending" | "running" | "success" | "error" | "cancelled";
+
+interface ExecutionStatusResponse {
+  status: ExecutionStatus;
+  nodeStatuses?: Array<{ nodeId: string; status: string }>;
+  progress?: {
+    totalSteps: number;
+    completedSteps: number;
+    runningSteps: number;
+    currentNodeId: string;
+    percentage: number;
+  };
+}
+
+// ── KeeperHub API helpers ─────────────────────────────────────────────────────
+async function triggerWebhook(payload: WebhookPayload, taskId: string): Promise<WebhookResponse> {
   const url = `${KEEPERHUB_BASE_URL}/${KEEPERHUB_WORKFLOW_ID}/webhook`;
   log(AGENT, "info", `Triggering KeeperHub webhook — ${url}`, taskId);
 
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${KEEPERHUB_USER_API_KEY}`
+    },
     body: JSON.stringify(payload),
   });
 
@@ -75,7 +97,39 @@ async function triggerWebhook(payload: WebhookPayload, taskId: string): Promise<
     throw new Error(`KeeperHub webhook returned HTTP ${res.status}: ${body}`);
   }
 
-  log(AGENT, "info", `Webhook accepted (HTTP ${res.status})`, taskId);
+  const data = await res.json() as WebhookResponse;
+  log(AGENT, "info", `Webhook accepted — executionId=${data.executionId} status=${data.status}`, taskId);
+  return data;
+}
+
+async function fetchExecutionStatus(executionId: string): Promise<ExecutionStatusResponse> {
+  const url = `${KEEPERHUB_BASE_URL}/executions/${executionId}/status`;
+  const res = await fetch(url, {
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${KEEPERHUB_ORG_API_KEY}`
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Status fetch returned HTTP ${res.status}`);
+  }
+  return res.json() as Promise<ExecutionStatusResponse>;
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function pollUntilSettled(executionId: string, taskId: string): Promise<ExecutionStatusResponse> {
+  for (let attempt = 1; attempt <= POLL_MAX_ATTEMPTS; attempt++) {
+    const statusRes = await fetchExecutionStatus(executionId);
+    const pct = statusRes.progress?.percentage ?? "?";
+    log(AGENT, "info", `Poll ${attempt}/${POLL_MAX_ATTEMPTS} executionId=${executionId} status=${statusRes.status} progress=${pct}%`, taskId);
+
+    if (statusRes.status === "success" || statusRes.status === "error" || statusRes.status === "cancelled") {
+      return statusRes;
+    }
+    if (attempt < POLL_MAX_ATTEMPTS) await sleep(POLL_INTERVAL_MS);
+  }
+  throw new Error(`Execution not settled after ${POLL_MAX_ATTEMPTS} attempts (executionId=${executionId})`);
 }
 
 // ── APPROVE handler ───────────────────────────────────────────────────────────
@@ -112,38 +166,62 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
   // 3. Trigger KeeperHub workflow via webhook.
   const webhookPayload: WebhookPayload = {
     taskId,
-    goal: research.goal,
-    chainId: UNISWAP_CHAIN_ID,
-    recipient: SWAP_RECIPIENT,
     tokenIn: research.tokenIn,
     tokenOut: research.tokenOut,
     amountIn: research.amountIn,
-    amountOut: research.amountOut,
-    bestRoute: research.bestRoute,
-    priceImpact: research.priceImpact,
-    gasEstimate: research.gasEstimate,
-    gasEstimateUSD: research.gasEstimateUSD,
+    fee: 500,
+    recipient: SWAP_RECIPIENT || "0x94d95Ff2C8056d7644f89A9b77cEE5021FDc4021",
+    amountOutMinimum: 0,
+    sqrtPriceLimitX96: 0,
   };
 
+  let executionId: string;
   try {
-    await triggerWebhook(webhookPayload, taskId);
+    const webhookRes = await triggerWebhook(webhookPayload, taskId);
+    executionId = webhookRes.executionId;
   } catch (err) {
     log(AGENT, "error", `KeeperHub webhook failed: ${toErrMsg(err)}`, taskId);
     await notifyError(taskId, toErrMsg(err));
     return;
   }
 
-  // 4. Persist execution record to 0G Storage.
+  // 4. Notify planner the swap is being processed by KeeperHub.
+  if (PLANNER_PEER_ID) {
+    try {
+      await axl.sendMessage(PLANNER_PEER_ID,
+        createMessage("executor", "planner", "PROGRESS", { phase: "processing", executionId }, taskId));
+    } catch { /* best-effort */ }
+  }
+
+  // 5. Poll until KeeperHub confirms success/error.
+  let settled: ExecutionStatusResponse;
+  try {
+    settled = await pollUntilSettled(executionId, taskId);
+  } catch (err) {
+    log(AGENT, "error", `Polling exhausted: ${toErrMsg(err)}`, taskId);
+    await notifyError(taskId, toErrMsg(err));
+    return;
+  }
+
+  if (settled.status === "error" || settled.status === "cancelled") {
+    log(AGENT, "error", `KeeperHub execution ${settled.status} — executionId=${executionId}`, taskId);
+    await notifyError(taskId, `KeeperHub execution ${settled.status} (executionId=${executionId})`);
+    return;
+  }
+
+  log(AGENT, "info", `KeeperHub execution success — executionId=${executionId}`, taskId);
+
+  // 6. Persist execution record to 0G Storage.
   try {
     await memory.set(`execution:${taskId}`, {
       taskId,
-      webhookTriggered: true,
+      executionId,
       workflowId: KEEPERHUB_WORKFLOW_ID,
       chainId: UNISWAP_CHAIN_ID,
       tokenIn: research.tokenIn,
       tokenOut: research.tokenOut,
       amountIn: research.amountIn,
-      status: "TRIGGERED",
+      status: "SUCCESS",
       executedAt: Date.now(),
     });
     log(AGENT, "info", `Execution record written to 0G Storage at execution:${taskId}`, taskId);
@@ -153,8 +231,9 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
 
   try {
     await memory.appendLog({
-      event: "TRIGGERED",
+      event: "SUCCESS",
       taskId,
+      executionId,
       workflowId: KEEPERHUB_WORKFLOW_ID,
       tokenIn: research.tokenIn.symbol,
       tokenOut: research.tokenOut.symbol,
@@ -165,13 +244,14 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
     log(AGENT, "warn", `appendLog failed (non-fatal): ${toErrMsg(err)}`, taskId);
   }
 
-  // 5. Notify Planner — webhook dispatched, KeeperHub takes it from here.
+  // 7. Notify Planner — swap confirmed by KeeperHub.
   if (!PLANNER_PEER_ID) {
     log(AGENT, "warn", "PLANNER_PEER_ID not set — skipping AXL dispatch", taskId);
     return;
   }
 
   const doneMsg = createMessage("executor", "planner", "DONE", {
+    executionId,
     workflowId: KEEPERHUB_WORKFLOW_ID,
     planKey: payload?.planKey,
     executionKey: `execution:${taskId}`,

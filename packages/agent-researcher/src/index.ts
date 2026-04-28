@@ -47,8 +47,8 @@ const memory = new MemoryStore({
 // ── Known Sepolia token registry ──────────────────────────────────────────────
 const SEPOLIA_TOKENS: Record<string, { address: string; decimals: number }> = {
   WETH: { address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14", decimals: 18 },
-  USDC: { address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", decimals: 6 },
-  UNI:  { address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18 },
+  USDC: { address: "0x6f14C02Fc1F78322cFd7d707aB90f18baD3B54f5", decimals: 6 },
+  UNI: { address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18 },
 };
 
 // ── LLM swap intent resolution ────────────────────────────────────────────────
@@ -59,7 +59,7 @@ interface SwapParams {
   tokenOutSymbol: string;
   tokenOutAddress: string;
   tokenOutDecimals: number;
-  amountIn: string;      // base units (e.g. "75000000" for 75 USDC)
+  amountIn: string;      // base units (e.g. "75000000000000000000" for 75 UNI)
   amountInHuman: string; // human-readable (e.g. "75")
   rationale: string;
 }
@@ -78,22 +78,22 @@ Your job is to resolve a swap intent into exact on-chain parameters for the Unis
 
 Available tokens on Sepolia:
 ${JSON.stringify(
-  Object.entries(SEPOLIA_TOKENS).map(([symbol, info]) => ({ symbol, ...info })),
-  null, 2
-)}
+          Object.entries(SEPOLIA_TOKENS).map(([symbol, info]) => ({ symbol, ...info })),
+          null, 2
+        )}
 
 RULES:
 - tokenIn/tokenOut must be chosen from the list above
 - amountIn must be in base units: multiply the human amount by 10^decimals, floor to integer, no decimal point
-  Example: 75 USDC (6 decimals) → "75000000"
-  Example: 10 UNI (18 decimals) → "10000000000000000000"
+  Example: 75 UNI (18 decimals) → "75000000000000000000"
+  Example: 10 WETH (18 decimals) → "10000000000000000000"
 - If goal says "half of X", compute floor(X / 2)
 - ETH and WETH are the same address on Sepolia — use WETH
 - Default fallback if unclear: 1 UNI → WETH
 
 ALWAYS respond with valid JSON:
 {
-  "tokenInSymbol": "USDC",
+  "tokenInSymbol": "UNI",
   "tokenInAddress": "0x...",
   "tokenInDecimals": 6,
   "tokenOutSymbol": "WETH",
@@ -121,15 +121,15 @@ ALWAYS respond with valid JSON:
   const resolvedOut = SEPOLIA_TOKENS[parsed.tokenOutSymbol ?? ""] ?? fallbackOut;
 
   return {
-    tokenInSymbol:    parsed.tokenInSymbol    ?? "UNI",
-    tokenInAddress:   parsed.tokenInAddress   ?? resolvedIn.address,
-    tokenInDecimals:  parsed.tokenInDecimals  ?? resolvedIn.decimals,
-    tokenOutSymbol:   parsed.tokenOutSymbol   ?? "WETH",
-    tokenOutAddress:  parsed.tokenOutAddress  ?? resolvedOut.address,
+    tokenInSymbol: parsed.tokenInSymbol ?? "UNI",
+    tokenInAddress: parsed.tokenInAddress ?? resolvedIn.address,
+    tokenInDecimals: parsed.tokenInDecimals ?? resolvedIn.decimals,
+    tokenOutSymbol: parsed.tokenOutSymbol ?? "WETH",
+    tokenOutAddress: parsed.tokenOutAddress ?? resolvedOut.address,
     tokenOutDecimals: parsed.tokenOutDecimals ?? resolvedOut.decimals,
-    amountIn:         parsed.amountIn         ?? "1000000000000000000",
-    amountInHuman:    parsed.amountInHuman    ?? "1",
-    rationale:        parsed.rationale        ?? "Default swap parameters",
+    amountIn: parsed.amountIn ?? "1000000000000000000",
+    amountInHuman: parsed.amountInHuman ?? "1",
+    rationale: parsed.rationale ?? "Default swap parameters",
   };
 }
 
