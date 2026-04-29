@@ -22,7 +22,7 @@ const KEEPERHUB_USER_API_KEY = process.env.KEEPERHUB_USER_API_KEY ?? "";
 const KEEPERHUB_ORG_API_KEY = process.env.KEEPERHUB_ORG_API_KEY ?? "";
 const KEEPERHUB_BASE_URL = process.env.KEEPERHUB_BASE_URL ?? "https://app.keeperhub.com/api/workflows";
 
-const SWAP_RECIPIENT = process.env.SWAP_RECIPIENT ?? "";
+const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS ?? "";
 const UNISWAP_CHAIN_ID = Number(process.env.UNISWAP_CHAIN_ID ?? "11155111");
 
 const ZEROG_INDEXER_URL = process.env.ZEROG_INDEXER_URL ?? "";
@@ -170,7 +170,7 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
     tokenOut: research.tokenOut,
     amountIn: research.amountIn,
     fee: 500,
-    recipient: SWAP_RECIPIENT || "0x94d95Ff2C8056d7644f89A9b77cEE5021FDc4021",
+    recipient: TREASURY_ADDRESS,
     amountOutMinimum: 0,
     sqrtPriceLimitX96: 0,
   };
@@ -311,7 +311,7 @@ async function main(): Promise<void> {
     [
       ["KEEPERHUB_WORKFLOW_ID", KEEPERHUB_WORKFLOW_ID],
       ["PLANNER_PEER_ID", PLANNER_PEER_ID],
-      ["SWAP_RECIPIENT", SWAP_RECIPIENT],
+      ["TREASURY_ADDRESS", TREASURY_ADDRESS],
       ["ZEROG_RPC_URL", ZEROG_RPC_URL],
       ["ZEROG_PRIVATE_KEY", ZEROG_PRIVATE_KEY],
       ["ZEROG_FLOW_ADDRESS", ZEROG_FLOW_ADDRESS],

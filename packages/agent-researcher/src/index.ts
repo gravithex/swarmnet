@@ -23,7 +23,7 @@ const HEALTH_PORT = Number(process.env.HEALTH_PORT ?? "3002");
 const UNISWAP_API_KEY = process.env.UNISWAP_API_KEY ?? "";
 const UNISWAP_CHAIN_ID = Number(process.env.UNISWAP_CHAIN_ID ?? "11155111");
 const UNISWAP_QUOTE_URL = "https://trade-api.gateway.uniswap.org/v1/quote";
-const EXECUTOR_WALLET_ADDRESS = process.env.EXECUTOR_WALLET_ADDRESS ?? "";
+const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS ?? "";
 
 const ZEROG_INDEXER_URL = process.env.ZEROG_INDEXER_URL ?? "";
 const ZEROG_KV_URL = process.env.ZEROG_KV_URL ?? "";
@@ -191,7 +191,7 @@ async function fetchResearch(goal: string, params: SwapParams, taskId: string): 
     tokenIn: params.tokenInAddress,
     tokenOutChainId: UNISWAP_CHAIN_ID,
     tokenOut: params.tokenOutAddress,
-    swapper: EXECUTOR_WALLET_ADDRESS,
+    swapper: TREASURY_ADDRESS,
     amount: params.amountIn,
     type: "EXACT_INPUT",
     routingPreference: "BEST_PRICE",
