@@ -29,6 +29,8 @@ const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
 const ZEROG_STREAM_ID = process.env.ZEROG_STREAM_ID ?? "";
 
+const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL ?? ""
+
 // ── sentinel config ───────────────────────────────────────────────────────────
 const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS ?? "";
 // How often the sentinel polls the treasury (ms). Default: 5 min.
@@ -449,9 +451,9 @@ async function sentinelTick(): Promise<void> {
     };
     log(AGENT, "info", "Sentinel: using demo snapshot (SENTINEL_DEMO_MODE=true)");
   } else {
-    if (!ZEROG_RPC_URL) return;
+    if (!ALCHEMY_RPC_URL) return;
     try {
-      snapshot = await readWalletSnapshot(ZEROG_RPC_URL, TREASURY_ADDRESS, WATCHED_TOKENS);
+      snapshot = await readWalletSnapshot(ALCHEMY_RPC_URL, TREASURY_ADDRESS, WATCHED_TOKENS);
     } catch (err) {
       log(AGENT, "warn", `Sentinel: wallet read failed — ${toErrMsg(err)}`);
       return;
