@@ -47,7 +47,7 @@ const memory = new MemoryStore({
 // ── Known Sepolia token registry ──────────────────────────────────────────────
 const SEPOLIA_TOKENS: Record<string, { address: string; decimals: number }> = {
   WETH: { address: "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14", decimals: 18 },
-  USDC: { address: "0x6f14C02Fc1F78322cFd7d707aB90f18baD3B54f5", decimals: 6 },
+  USDC: { address: "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", decimals: 6 },
   UNI: { address: "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984", decimals: 18 },
 };
 
@@ -135,11 +135,10 @@ ALWAYS respond with valid JSON:
 
 // ── Uniswap types ─────────────────────────────────────────────────────────────
 interface UniswapToken {
-  chainId: number;
   address: string;
-  decimals: number;
+  chainId: number;
   symbol: string;
-  name?: string;
+  decimals: string; // returned as string by the API
 }
 
 interface UniswapRouteHop {
@@ -149,6 +148,8 @@ interface UniswapRouteHop {
   tokenOut?: UniswapToken;
   fee?: string;
   liquidity?: string;
+  sqrtRatioX96?: string;
+  tickCurrent?: string;
   amountIn?: string;
   amountOut?: string;
   [key: string]: unknown;
@@ -158,16 +159,20 @@ interface UniswapQuoteSuccess {
   routing: string;
   quote: {
     chainId: number;
-    swapType: string;
-    input: { token: UniswapToken; amount: string };
-    output: { token: UniswapToken; amount: string };
-    priceImpact: string;
+    swapper: string;
+    tradeType: string;
+    // input.token and output.token are plain address strings, not objects
+    input: { amount: string; token: string };
+    output: { amount: string; token: string; recipient: string };
+    priceImpact: number;
+    gasFee: string;
+    gasFeeUSD: string;
     gasUseEstimate: string;
-    gasUseEstimateUSD?: string;
     route: UniswapRouteHop[][];
-    routeString?: string;
-    slippage?: number;
+    slippage: number;
+    quoteId: string;
   };
+  permitData?: unknown;
 }
 
 interface UniswapQuoteError {
@@ -195,8 +200,8 @@ async function fetchResearch(goal: string, params: SwapParams, taskId: string): 
     amount: params.amountIn,
     type: "EXACT_INPUT",
     routingPreference: "BEST_PRICE",
-    slippageTolerance: 0.3,
-    protocols: ["V4", "V3"],
+    slippageTolerance: 0.5,
+    protocols: ["V3"],
   };
 
   const res = await fetch(UNISWAP_QUOTE_URL, {
@@ -217,31 +222,40 @@ async function fetchResearch(goal: string, params: SwapParams, taskId: string): 
   }
 
   const { quote } = raw;
+  const hops = quote.route.flat();
 
-  const pools = [
-    ...new Set(
-      quote.route
-        .flat()
-        .map((hop) => hop.address)
-        .filter((addr): addr is string => typeof addr === "string" && addr.length > 0)
-    ),
-  ];
+  // Token metadata comes from route hops — input/output only carry the address.
+  const firstHop = hops[0];
+  const lastHop = hops.at(-1);
+  const tokenInMeta = firstHop?.tokenIn;
+  const tokenOutMeta = lastHop?.tokenOut;
 
-  const bestRoute = quote.routeString ?? quote.route
-    .map((hops) => hops.map((h) => h.address).join(" → "))
-    .join(" | ");
+  const pools = [...new Set(hops.map((h) => h.address).filter(Boolean))];
+
+  // Build a human-readable route: "USDC → WETH" (or multi-hop "A → B → C").
+  const routeSymbols = hops.map((h) => h.tokenIn?.symbol ?? h.address);
+  if (lastHop?.tokenOut?.symbol) routeSymbols.push(lastHop.tokenOut.symbol);
+  const bestRoute = routeSymbols.join(" → ");
 
   return {
     goal,
-    tokenIn: { symbol: quote.input.token.symbol, address: quote.input.token.address, chainId: quote.input.token.chainId },
-    tokenOut: { symbol: quote.output.token.symbol, address: quote.output.token.address, chainId: quote.output.token.chainId },
+    tokenIn: {
+      symbol: tokenInMeta?.symbol ?? params.tokenInSymbol,
+      address: quote.input.token,
+      chainId: tokenInMeta?.chainId ?? UNISWAP_CHAIN_ID,
+    },
+    tokenOut: {
+      symbol: tokenOutMeta?.symbol ?? params.tokenOutSymbol,
+      address: quote.output.token,
+      chainId: tokenOutMeta?.chainId ?? UNISWAP_CHAIN_ID,
+    },
     amountIn: quote.input.amount,
     amountOut: quote.output.amount,
     pools,
     bestRoute,
-    priceImpact: quote.priceImpact,
+    priceImpact: String(quote.priceImpact),
     gasEstimate: quote.gasUseEstimate,
-    gasEstimateUSD: quote.gasUseEstimateUSD,
+    gasEstimateUSD: quote.gasFeeUSD,
     fetchedAt: Date.now(),
   };
 }

@@ -27,6 +27,8 @@ const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
 const ZEROG_STREAM_ID = process.env.ZEROG_STREAM_ID ?? "";
 
+const USE_KV_STORAGE = process.env.USE_KV_STORAGE === "true";
+
 // ── clients ───────────────────────────────────────────────────────────────────
 const axl = new AXLClient(AXL_NODE_URL);
 
@@ -127,17 +129,26 @@ async function handleResearchDone(msg: AgentMessage): Promise<void> {
     } catch { /* best-effort */ }
   }
 
-  // 1. Read research data — prefer inline payload, fall back to 0G KV.
+  // 1. Read research data.
+  //    USE_KV_STORAGE=true  → read from 0G KV first, fall back to inline payload
+  //    USE_KV_STORAGE=false → inline AXL payload only
   let research: ResearchData;
   try {
-    if (payload?.researchData) {
+    if (USE_KV_STORAGE) {
+      const stored = await memory.get<ResearchData>(researchKey);
+      if (stored !== null) {
+        research = stored;
+        log(AGENT, "info", `Research loaded from 0G KV — priceImpact=${research.priceImpact}% gasEstimate=${research.gasEstimate}`, taskId);
+      } else if (payload?.researchData) {
+        research = payload.researchData;
+        log(AGENT, "info", `0G KV miss — research loaded from AXL payload fallback`, taskId);
+      } else {
+        throw new Error(`Research not found in 0G KV (key=${researchKey}) and not in AXL payload`);
+      }
+    } else {
+      if (!payload?.researchData) throw new Error(`RESEARCH_DONE payload missing researchData (key=${researchKey})`);
       research = payload.researchData;
       log(AGENT, "info", `Research loaded from AXL payload — priceImpact=${research.priceImpact}% gasEstimate=${research.gasEstimate}`, taskId);
-    } else {
-      const stored = await memory.get<ResearchData>(researchKey);
-      if (stored === null) throw new Error(`key ${researchKey} not found in 0G Storage`);
-      research = stored;
-      log(AGENT, "info", `Research loaded from 0G — priceImpact=${research.priceImpact}% gasEstimate=${research.gasEstimate}`, taskId);
     }
   } catch (err) {
     log(AGENT, "error", `Failed to read research: ${toErrMsg(err)}`, taskId);

@@ -57,8 +57,8 @@ export class MemoryStore {
     try {
       const kvClient = new KvClient(this.kvClientUrl);
       const keyBytes = Uint8Array.from(Buffer.from(key, "utf-8"));
-      const val = await kvClient.getValue(this.streamId, keyBytes);
-      if (val === null) return null;
+      const val = await kvClient.getValue(this.streamId, ethers.encodeBase64(keyBytes) as any);
+      if (val === null || val.data === "") return null;
       const json = Buffer.from(val.data, "base64").toString("utf-8");
       return JSON.parse(json) as T;
     } catch (err) {

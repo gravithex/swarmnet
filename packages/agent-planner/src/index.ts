@@ -63,6 +63,108 @@ interface TaskStatus {
 
 const taskStatus = new Map<string, TaskStatus>();
 
+// Tracks goalContext per taskId so recovery writes always include it.
+const taskGoalContext = new Map<string, GoalContext>();
+
+// ── crash recovery ────────────────────────────────────────────────────────────
+const RECOVERY_KEY = "swarm:current-task";
+
+interface CurrentTaskRecord {
+  taskId: string;
+  goal: string;
+  phase: TaskPhase;
+  goalContext: GoalContext | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+async function saveTaskState(taskId: string, goal: string, phase: TaskPhase): Promise<void> {
+  try {
+    await memory.set(RECOVERY_KEY, {
+      taskId,
+      goal,
+      phase,
+      goalContext: taskGoalContext.get(taskId) ?? null,
+      createdAt: taskStatus.get(taskId)?.createdAt ?? Date.now(),
+      updatedAt: Date.now(),
+    } satisfies CurrentTaskRecord);
+  } catch (err) {
+    log(AGENT, "warn", `saveTaskState failed (non-fatal): ${toErrMsg(err)}`);
+  }
+}
+
+async function attemptRecovery(): Promise<void> {
+  if (!ZEROG_KV_URL) {
+    log(AGENT, "info", "Recovery: ZEROG_KV_URL not set — skipping");
+    return;
+  }
+
+  let record: CurrentTaskRecord | null;
+  try {
+    record = await memory.get<CurrentTaskRecord>(RECOVERY_KEY);
+  } catch (err) {
+    log(AGENT, "warn", `Recovery: 0G KV read failed — ${toErrMsg(err)}`);
+    return;
+  }
+
+  if (!record) {
+    log(AGENT, "info", "Recovery: no saved task state found");
+    return;
+  }
+
+  const TERMINAL: TaskPhase[] = ["done", "rejected", "error"];
+  if (TERMINAL.includes(record.phase)) {
+    log(AGENT, "info", `Recovery: last task ${record.taskId} already terminal (${record.phase}) — nothing to resume`);
+    return;
+  }
+
+  const { taskId, goal, phase, goalContext, createdAt } = record;
+  log(AGENT, "info", `Recovery: found in-progress task ${taskId} at phase=${phase} — resuming`);
+
+  // Restore in-memory status so /status/:taskId reflects it immediately.
+  taskStatus.set(taskId, { taskId, goal, phase, createdAt, updatedAt: Date.now() });
+
+  if (!RESEARCHER_PEER_ID) {
+    log(AGENT, "warn", "Recovery: RESEARCHER_PEER_ID not set — cannot re-dispatch");
+    return;
+  }
+
+  // Resolve goalContext from record, then 0G plan key, then re-run LLM as last resort.
+  let ctx = goalContext;
+  if (!ctx) {
+    try {
+      const plan = await memory.get<{ goalContext: GoalContext }>(`plan:${taskId}`);
+      ctx = plan?.goalContext ?? null;
+    } catch { /* ignore */ }
+  }
+  if (!ctx) {
+    log(AGENT, "info", `Recovery: re-running LLM planning for task ${taskId}`);
+    try {
+      ctx = await planWithLLM(goal, taskId);
+    } catch (err) {
+      log(AGENT, "error", `Recovery: LLM re-planning failed — ${toErrMsg(err)}`);
+      return;
+    }
+  }
+
+  taskGoalContext.set(taskId, ctx);
+  const steps = buildSteps(ctx);
+  const msg = createMessage("planner", "researcher", "TASK", {
+    goal,
+    goalContext: ctx,
+    steps,
+    planKey: `plan:${taskId}`,
+  }, taskId);
+
+  try {
+    await axl.sendMessage(RESEARCHER_PEER_ID, msg);
+    taskStatus.set(taskId, { ...taskStatus.get(taskId)!, phase: "researching", updatedAt: Date.now() });
+    log(AGENT, "info", `Recovery: TASK re-dispatched to researcher (peer=${RESEARCHER_PEER_ID}) — task ${taskId} resuming from phase=${phase}`);
+  } catch (err) {
+    log(AGENT, "error", `Recovery: AXL re-dispatch failed — ${toErrMsg(err)}`);
+  }
+}
+
 // ── clients ───────────────────────────────────────────────────────────────────
 const axl = new AXLClient(AXL_NODE_URL);
 
@@ -180,6 +282,8 @@ async function handleGoal(goal: string): Promise<string> {
     };
   }
 
+  taskGoalContext.set(taskId, goalContext);
+
   const steps = buildSteps(goalContext);
   const plan = {
     taskId,
@@ -213,6 +317,7 @@ async function handleGoal(goal: string): Promise<string> {
     await axl.sendMessage(RESEARCHER_PEER_ID, msg);
     log(AGENT, "info", `TASK dispatched to researcher via AXL (peer=${RESEARCHER_PEER_ID})`, taskId);
     taskStatus.set(taskId, { ...taskStatus.get(taskId)!, phase: "researching", updatedAt: Date.now() });
+    await saveTaskState(taskId, goal, "researching");
   } catch (err) {
     log(AGENT, "error", `AXL sendMessage failed: ${toErrMsg(err)}`, taskId);
     throw err;
@@ -230,7 +335,9 @@ async function handleMessage(msg: AgentMessage): Promise<void> {
   if (msg.type === "PROGRESS") {
     const phase = (msg.payload as { phase?: TaskPhase })?.phase;
     if (phase && taskStatus.has(msg.taskId)) {
-      taskStatus.set(msg.taskId, { ...taskStatus.get(msg.taskId)!, phase, updatedAt: Date.now() });
+      const updated = { ...taskStatus.get(msg.taskId)!, phase, updatedAt: Date.now() };
+      taskStatus.set(msg.taskId, updated);
+      await saveTaskState(msg.taskId, updated.goal, phase);
     }
     return;
   }
@@ -238,12 +345,14 @@ async function handleMessage(msg: AgentMessage): Promise<void> {
   if (msg.type === "DONE") {
     const p = msg.payload as { txHash?: string };
     const existing = taskStatus.get(msg.taskId);
+    const goal = existing?.goal ?? "";
     taskStatus.set(msg.taskId, {
-      ...(existing ?? { taskId: msg.taskId, goal: "", createdAt: Date.now() }),
+      ...(existing ?? { taskId: msg.taskId, goal, createdAt: Date.now() }),
       phase: "done",
       txHash: p?.txHash,
       updatedAt: Date.now(),
     });
+    await saveTaskState(msg.taskId, goal, "done");
     try {
       await memory.appendLog({
         event: "DONE",
@@ -261,12 +370,14 @@ async function handleMessage(msg: AgentMessage): Promise<void> {
   if (msg.type === "REJECT") {
     const p = msg.payload as { reason?: string; confidence?: number };
     const existing = taskStatus.get(msg.taskId);
+    const goal = existing?.goal ?? "";
     taskStatus.set(msg.taskId, {
-      ...(existing ?? { taskId: msg.taskId, goal: "", createdAt: Date.now() }),
+      ...(existing ?? { taskId: msg.taskId, goal, createdAt: Date.now() }),
       phase: "rejected",
       reason: p?.reason,
       updatedAt: Date.now(),
     });
+    await saveTaskState(msg.taskId, goal, "rejected");
     try {
       await memory.appendLog({
         event: "REJECT",
@@ -284,12 +395,14 @@ async function handleMessage(msg: AgentMessage): Promise<void> {
   if (msg.type === "ERROR") {
     const p = msg.payload as { detail?: string };
     const existing = taskStatus.get(msg.taskId);
+    const goal = existing?.goal ?? "";
     taskStatus.set(msg.taskId, {
-      ...(existing ?? { taskId: msg.taskId, goal: "", createdAt: Date.now() }),
+      ...(existing ?? { taskId: msg.taskId, goal, createdAt: Date.now() }),
       phase: "error",
       error: p?.detail,
       updatedAt: Date.now(),
     });
+    await saveTaskState(msg.taskId, goal, "error");
     log(AGENT, "error", `ERROR from ${msg.from}: ${JSON.stringify(msg.payload)}`, msg.taskId);
     return;
   }
@@ -523,6 +636,9 @@ async function main(): Promise<void> {
   // Subscribe to incoming AXL messages.
   axl.onMessage(handleMessage);
   log(AGENT, "info", "Subscribed to AXL message stream");
+
+  // Attempt to resume any task that was in-progress before the last shutdown.
+  await attemptRecovery();
 
   startHttp();
   startSentinel();

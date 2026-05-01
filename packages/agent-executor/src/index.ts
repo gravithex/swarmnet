@@ -24,6 +24,7 @@ const KEEPERHUB_BASE_URL = process.env.KEEPERHUB_BASE_URL ?? "https://app.keeper
 
 const TREASURY_ADDRESS = process.env.TREASURY_ADDRESS ?? "";
 const UNISWAP_CHAIN_ID = Number(process.env.UNISWAP_CHAIN_ID ?? "11155111");
+const UNISWAP_ROUTER = process.env.UNISWAP_ROUTER ?? "0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48";
 
 const ZEROG_INDEXER_URL = process.env.ZEROG_INDEXER_URL ?? "";
 const ZEROG_KV_URL = process.env.ZEROG_KV_URL ?? "";
@@ -31,6 +32,8 @@ const ZEROG_RPC_URL = process.env.ZEROG_RPC_URL ?? "";
 const ZEROG_PRIVATE_KEY = process.env.ZEROG_PRIVATE_KEY ?? "";
 const ZEROG_FLOW_ADDRESS = process.env.ZEROG_FLOW_ADDRESS ?? "";
 const ZEROG_STREAM_ID = process.env.ZEROG_STREAM_ID ?? "";
+
+const USE_KV_STORAGE = process.env.USE_KV_STORAGE === "true";
 
 const POLL_INTERVAL_MS = 5_000;
 const POLL_MAX_ATTEMPTS = 20;
@@ -49,12 +52,12 @@ const memory = new MemoryStore({
 
 // ── KeeperHub types ───────────────────────────────────────────────────────────
 interface WebhookPayload {
-  taskId: string;
-  tokenIn: ResearchData["tokenIn"];
-  tokenOut: ResearchData["tokenOut"];
+  tokenIn: ResearchData["tokenIn"]["address"];
+  tokenOut: ResearchData["tokenOut"]["address"];
   amountIn: string;
   fee: number;
   recipient: string;
+  spender: string;
   amountOutMinimum: number;
   sqrtPriceLimitX96: number;
 }
@@ -145,15 +148,32 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
 
   const researchKey = payload?.researchKey ?? `research:${taskId}`;
 
-  // 1. Research data travels inline in the AXL payload — no KV read needed.
-  if (!payload?.researchData) {
-    const errMsg = `APPROVE payload missing researchData (key=${researchKey})`;
-    log(AGENT, "error", errMsg, taskId);
-    await notifyError(taskId, errMsg);
+  // 1. Read research data.
+  //    USE_KV_STORAGE=true  → read from 0G KV first, fall back to inline payload
+  //    USE_KV_STORAGE=false → inline AXL payload only
+  let research: ResearchData;
+  try {
+    if (USE_KV_STORAGE) {
+      const stored = await memory.get<ResearchData>(researchKey);
+      if (stored !== null) {
+        research = stored;
+        log(AGENT, "info", `Research loaded from 0G KV — ${research.tokenIn.symbol}→${research.tokenOut.symbol} amountIn=${research.amountIn}`, taskId);
+      } else if (payload?.researchData) {
+        research = payload.researchData;
+        log(AGENT, "info", `0G KV miss — research loaded from AXL payload fallback`, taskId);
+      } else {
+        throw new Error(`Research not found in 0G KV (key=${researchKey}) and not in AXL payload`);
+      }
+    } else {
+      if (!payload?.researchData) throw new Error(`APPROVE payload missing researchData (key=${researchKey})`);
+      research = payload.researchData;
+      log(AGENT, "info", `Research loaded from AXL payload — ${research.tokenIn.symbol}→${research.tokenOut.symbol} amountIn=${research.amountIn}`, taskId);
+    }
+  } catch (err) {
+    log(AGENT, "error", `Failed to read research: ${toErrMsg(err)}`, taskId);
+    await notifyError(taskId, toErrMsg(err));
     return;
   }
-  const research: ResearchData = payload.researchData;
-  log(AGENT, "info", `Research loaded — ${research.tokenIn.symbol}→${research.tokenOut.symbol} amountIn=${research.amountIn}`, taskId);
 
   // 2. Notify planner that execution has started.
   if (PLANNER_PEER_ID) {
@@ -165,12 +185,12 @@ async function handleApprove(msg: AgentMessage): Promise<void> {
 
   // 3. Trigger KeeperHub workflow via webhook.
   const webhookPayload: WebhookPayload = {
-    taskId,
-    tokenIn: research.tokenIn,
-    tokenOut: research.tokenOut,
+    tokenIn: research.tokenIn.address,
+    tokenOut: research.tokenOut.address,
     amountIn: research.amountIn,
-    fee: 500,
+    fee: 3000,
     recipient: TREASURY_ADDRESS,
+    spender: UNISWAP_ROUTER,
     amountOutMinimum: 0,
     sqrtPriceLimitX96: 0,
   };
