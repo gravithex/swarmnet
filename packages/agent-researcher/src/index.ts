@@ -7,6 +7,7 @@ import {
   createMessage,
   log,
   toErrMsg,
+  MAX_SLIPPAGE,
   type AgentMessage,
   type AgentRole,
   type ResearchData,
@@ -64,6 +65,13 @@ interface SwapParams {
   rationale: string;
 }
 
+// Convert a human-readable decimal string to base units using BigInt to avoid float64 precision loss.
+function toBaseUnits(human: string, decimals: number): string {
+  const [whole, frac = ""] = human.split(".");
+  const fracPadded = frac.padEnd(decimals, "0").slice(0, decimals);
+  return (BigInt(whole) * (10n ** BigInt(decimals)) + BigInt(fracPadded || "0")).toString();
+}
+
 async function resolveSwapParams(goal: string, goalContext: unknown, taskId: string): Promise<SwapParams> {
   const llm = createLLMClient();
 
@@ -74,7 +82,7 @@ async function resolveSwapParams(goal: string, goalContext: unknown, taskId: str
       {
         role: "system",
         content: `You are the Researcher agent of a DeFi swarm on Ethereum Sepolia testnet.
-Your job is to resolve a swap intent into exact on-chain parameters for the Uniswap API.
+Your job is to resolve a swap intent into token symbols and a human-readable amount for the Uniswap API.
 
 Available tokens on Sepolia:
 ${JSON.stringify(
@@ -84,22 +92,15 @@ ${JSON.stringify(
 
 RULES:
 - tokenIn/tokenOut must be chosen from the list above
-- amountIn must be in base units: multiply the human amount by 10^decimals, floor to integer, no decimal point
-  Example: 75 UNI (18 decimals) → "75000000000000000000"
-  Example: 10 WETH (18 decimals) → "10000000000000000000"
-- If goal says "half of X", compute floor(X / 2)
+- amountInHuman must be a decimal string representing the human-readable amount (e.g. "75", "224.8875")
+- If goal says "half of X", compute X / 2 as a decimal string
 - ETH and WETH are the same address on Sepolia — use WETH
 - Default fallback if unclear: 1 UNI → WETH
 
 ALWAYS respond with valid JSON:
 {
   "tokenInSymbol": "UNI",
-  "tokenInAddress": "0x...",
-  "tokenInDecimals": 6,
   "tokenOutSymbol": "WETH",
-  "tokenOutAddress": "0x...",
-  "tokenOutDecimals": 18,
-  "amountIn": "75000000",
   "amountInHuman": "75",
   "rationale": "one sentence explaining the resolved parameters"
 }`,
@@ -120,15 +121,21 @@ ALWAYS respond with valid JSON:
   const resolvedIn = SEPOLIA_TOKENS[parsed.tokenInSymbol ?? ""] ?? fallbackIn;
   const resolvedOut = SEPOLIA_TOKENS[parsed.tokenOutSymbol ?? ""] ?? fallbackOut;
 
+  const tokenInSymbol = parsed.tokenInSymbol ?? "USDC";
+  const tokenOutSymbol = parsed.tokenOutSymbol ?? "WETH";
+  const amountInHuman = parsed.amountInHuman ?? "1";
+  // Compute base units in code — never trust LLM arithmetic
+  const amountIn = toBaseUnits(amountInHuman, resolvedIn.decimals);
+
   return {
-    tokenInSymbol: parsed.tokenInSymbol ?? "UNI",
-    tokenInAddress: parsed.tokenInAddress ?? resolvedIn.address,
-    tokenInDecimals: parsed.tokenInDecimals ?? resolvedIn.decimals,
-    tokenOutSymbol: parsed.tokenOutSymbol ?? "WETH",
-    tokenOutAddress: parsed.tokenOutAddress ?? resolvedOut.address,
-    tokenOutDecimals: parsed.tokenOutDecimals ?? resolvedOut.decimals,
-    amountIn: parsed.amountIn ?? "1000000000000000000",
-    amountInHuman: parsed.amountInHuman ?? "1",
+    tokenInSymbol,
+    tokenInAddress: resolvedIn.address,
+    tokenInDecimals: resolvedIn.decimals,
+    tokenOutSymbol,
+    tokenOutAddress: resolvedOut.address,
+    tokenOutDecimals: resolvedOut.decimals,
+    amountIn,
+    amountInHuman,
     rationale: parsed.rationale ?? "Default swap parameters",
   };
 }
@@ -200,7 +207,7 @@ async function fetchResearch(goal: string, params: SwapParams, taskId: string): 
     amount: params.amountIn,
     type: "EXACT_INPUT",
     routingPreference: "BEST_PRICE",
-    slippageTolerance: 0.5,
+    slippageTolerance: MAX_SLIPPAGE,
     protocols: ["V3"],
   };
 

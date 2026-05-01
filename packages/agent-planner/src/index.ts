@@ -9,6 +9,7 @@ import {
   createMessage,
   log,
   toErrMsg,
+  MAX_SLIPPAGE,
   type AgentMessage,
   type AgentRole,
   type PlanStep,
@@ -276,7 +277,7 @@ async function handleGoal(goal: string): Promise<string> {
       tokenOut: "USDC",
       amountDescription: goal,
       riskTolerance: "medium",
-      maxSlippagePct: 0.5,
+      maxSlippagePct: MAX_SLIPPAGE,
       rationale: goal,
       steps: [],
     };
@@ -497,10 +498,10 @@ Your job is to maximise the treasury's yield. You should ALWAYS find something t
 RULES — apply them in order, stop at the first match:
 
 1. If USDC balance > 10: swap at least half of it to WETH to gain ETH exposure.
-   Example goal: "Swap 75 USDC to WETH with max 0.5% slippage"
+   Example goal: "Swap 75 USDC to WETH with max 1% slippage"
 
 2. If UNI, LINK, or any non-WETH ERC-20 balance > 1: consolidate into WETH.
-   Example goal: "Swap 10 UNI to WETH with max 0.5% slippage"
+   Example goal: "Swap 10 UNI to WETH with max 1% slippage"
 
 3. If ETH balance > 0.05: wrap and deploy into the best Uniswap v3 WETH/USDC pool.
    Example goal: "Swap 0.05 ETH to USDC via the best Uniswap v3 WETH/USDC pool"
@@ -638,7 +639,7 @@ async function main(): Promise<void> {
   log(AGENT, "info", "Subscribed to AXL message stream");
 
   // Attempt to resume any task that was in-progress before the last shutdown.
-  await attemptRecovery();
+  // await attemptRecovery();
 
   startHttp();
   startSentinel();

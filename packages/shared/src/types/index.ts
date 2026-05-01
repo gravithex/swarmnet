@@ -1,5 +1,8 @@
 import { randomUUID } from "crypto";
 
+// ── trading config ────────────────────────────────────────────────────────────
+export const MAX_SLIPPAGE = 1; // percent, e.g. 1 = 1%
+
 export type AgentRole = "planner" | "researcher" | "critic" | "executor";
 
 export type MessageType =
