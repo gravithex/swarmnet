@@ -4,8 +4,8 @@
 
 1. **No central coordinator** — agents discover each other via AXL peer discovery, not a registry
 2. **No in-process shortcuts** — every inter-agent message goes through AXL, even if agents run on the same machine
-3. **Data travels in payloads** — research data is passed inline in AXL messages, not re-fetched from storage at each hop
-4. **0G Storage is the audit trail** — plans, critiques, chain-of-thought, and execution records are written to 0G for verifiability
+3. **Data travels in payloads** — research data is passed inline in AXL messages by default; `USE_KV_STORAGE=true` switches to 0G KV reads with inline fallback
+4. **0G Storage is the audit trail** — plans, critiques, chain-of-thought, and execution records are written to 0G for verifiability; `swarm:current-task` enables crash recovery
 5. **Execution is KeeperHub's job** — the Executor triggers a workflow webhook; it never calls Ethereum directly
 
 ## Message Flow
@@ -77,12 +77,15 @@ KV writes (via Indexer + Batcher → storage nodes):
   research:{taskId}       = { tokenIn, tokenOut, amountIn, amountOut, bestRoute, priceImpact, gasEstimate, fetchedAt }
   critique:{taskId}       = { confidence, verdict, reason, risks[], chainOfThought, scoredAt }
   execution:{taskId}      = { executionId, workflowId, tokenIn, tokenOut, amountIn, status, executedAt }
+  swarm:current-task      = { taskId, goal, phase, goalContext, createdAt, updatedAt }  ← crash recovery
 
 Append-only log (unique key per entry — no read-then-write):
   __log__:{ts}:{rand}     = { event, taskId, ... }
 ```
 
-> **Note on reads**: 0G KV reads require a dedicated KV node (32 GB RAM). In the current deployment, data flows **inline in AXL payloads** — reads from 0G are not required during normal operation. 0G Storage is used write-only as a verifiable audit trail.
+> **Data reads**: Set `USE_KV_STORAGE=true` to have the Critic and Executor read `research:{taskId}` from 0G KV (with inline AXL payload as fallback). Requires a KV node (32 GB RAM). Default is `false` — data flows inline in AXL payloads, no KV node needed.
+>
+> **Crash recovery**: The Planner writes `swarm:current-task` on every phase transition. On restart, it reads this key and re-dispatches `TASK` to the Researcher if an in-progress task is found. Requires `ZEROG_KV_URL` to be set.
 
 ## AXL Peer IDs
 
@@ -101,7 +104,8 @@ The Executor does not build transaction calldata. It POSTs a swap intent to the 
 
 ```
 POST /api/workflows/{workflowId}/webhook
-  Body: { taskId, tokenIn, tokenOut, amountIn, fee, recipient, amountOutMinimum, sqrtPriceLimitX96 }
+  Body: { tokenIn, tokenOut, amountIn, fee, recipient, spender, amountOutMinimum, sqrtPriceLimitX96 }
+        spender = UNISWAP_ROUTER — KeeperHub calls approve(spender, amountIn) before the swap
   Response: { executionId, status: "running" }
 
 GET /api/workflows/executions/{executionId}/status
@@ -121,3 +125,4 @@ GET /api/workflows/executions/{executionId}/status
 | KeeperHub execution error/cancelled | Executor | `notifyError` to Planner |
 | KeeperHub poll timeout (20 × 5s) | Executor | `notifyError` to Planner |
 | Critic REJECT | Critic | `REJECT` message to Planner, task phase → `rejected` |
+| Planner crash / restart | Planner (on startup) | Reads `swarm:current-task` from 0G KV; re-dispatches `TASK` to Researcher if phase is non-terminal |

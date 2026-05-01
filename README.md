@@ -106,10 +106,18 @@ KEEPERHUB_WORKFLOW_ID=your_workflow_id
 KEEPERHUB_USER_API_KEY=your_user_api_key   # for webhook auth
 KEEPERHUB_ORG_API_KEY=your_org_api_key    # for execution status polling
 
+# Uniswap — researcher fetches quotes, executor sends router address to KeeperHub
+UNISWAP_API_KEY=your_key
+UNISWAP_ROUTER=0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48   # Sepolia UniversalRouter
+
 # Sentinel — autonomous treasury monitoring
 TREASURY_ADDRESS=0x...          # wallet the Planner watches
 SENTINEL_INTERVAL_MS=300000     # poll every 5 min (default)
 SENTINEL_DEMO_MODE=false        # set true to skip chain read (no Sepolia ETH needed)
+
+# 0G KV toggle — set true when a KV node (32 GB RAM) is running
+# Agents read research data from 0G KV instead of AXL payload; Planner uses KV for crash recovery
+USE_KV_STORAGE=false
 ```
 
 ### Run
@@ -145,7 +153,7 @@ What happens step by step:
 1. **Planner** receives the goal → **0G Compute LLM** extracts `strategyType`, `tokenIn/Out`, `riskTolerance`, `maxSlippagePct`, and per-agent instructions → plan written to `plan:{taskId}` on 0G Storage, dispatched to Researcher via **AXL**
 2. **Researcher** receives `{goal, goalContext}` → **0G Compute LLM** resolves intent to exact params (USDC address, 6 decimals, `amountIn=75000000`) → fetches Uniswap best route → writes `research:{taskId}` to 0G Storage → sends full `researchData` to Critic inside the **AXL message payload**
 3. **Critic** receives research inline (no storage re-fetch) → **0G Compute LLM** reasons about price impact, sandwich risk, route quality → writes `critique:{taskId}` with **chain-of-thought** to 0G Storage → sends `APPROVE` or `REJECT` + `researchData` to Executor via **AXL**
-4. **Executor** receives `researchData` inline → triggers **KeeperHub workflow** via webhook (`tokenIn`, `tokenOut`, `amountIn`, `fee`, `recipient`) → polls `GET /executions/{id}/status` until `success` → result logged to 0G Storage
+4. **Executor** receives `researchData` → triggers **KeeperHub workflow** via webhook (`tokenIn`, `tokenOut`, `amountIn`, `fee`, `recipient`, `spender`) → KeeperHub calls `approve(spender, amountIn)` then executes the swap → Executor polls `GET /executions/{id}/status` until `success` → result logged to 0G Storage
 
 ### Sentinel mode (autonomous)
 
@@ -189,7 +197,7 @@ The Planner polls the treasury every `SENTINEL_INTERVAL_MS`. When it detects a b
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                     agent-critic :3003                           │
-│  ● Reads researchData from AXL payload (no KV fetch)             │
+│  ● Reads researchData from AXL payload (USE_KV_STORAGE=false)     │
 │  ● LLM (0G Compute): price impact, sandwich risk, route quality  │
 │  ● Writes critique:{taskId} + chain-of-thought to 0G Storage     │
 │  ● AXL peer: axl-critic                                          │
@@ -198,8 +206,9 @@ The Planner polls the treasury every `SENTINEL_INTERVAL_MS`. When it detects a b
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                    agent-executor :3004                          │
-│  ● Reads researchData from AXL payload (no KV fetch)             │
+│  ● Reads researchData from AXL payload (USE_KV_STORAGE=false)     │
 │  ● POST KeeperHub webhook → { executionId }                      │
+│  ● KeeperHub: approve(spender, amountIn) then swap               │
 │  ● Polls GET /executions/{executionId}/status until success      │
 │  ● Writes execution:{taskId} to 0G Storage                       │
 │  ● AXL peer: axl-executor                                        │
@@ -231,6 +240,7 @@ The Planner polls the treasury every `SENTINEL_INTERVAL_MS`. When it detects a b
 | `research:{taskId}` | Researcher | Uniswap route, amounts, gas estimate |
 | `critique:{taskId}` | Critic | Confidence, verdict, risks, **chain-of-thought** |
 | `execution:{taskId}` | Executor | KeeperHub executionId, token pair, status |
+| `swarm:current-task` | Planner | Current task phase — used for crash recovery on restart |
 | `__log__:{ts}:{rand}` | Critic + Executor + Planner | Append-only decision history (one key per entry) |
 
 ---

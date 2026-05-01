@@ -54,7 +54,7 @@ interface TaskStatus {
   taskId: string;
   goal: string;
   phase: TaskPhase;
-  txHash?: string;
+  executionId?: string;
   reason?: string;
   error?: string;
   createdAt: number;
@@ -343,13 +343,13 @@ async function handleMessage(msg: AgentMessage): Promise<void> {
   }
 
   if (msg.type === "DONE") {
-    const p = msg.payload as { txHash?: string };
+    const p = msg.payload as { executionId?: string };
     const existing = taskStatus.get(msg.taskId);
     const goal = existing?.goal ?? "";
     taskStatus.set(msg.taskId, {
       ...(existing ?? { taskId: msg.taskId, goal, createdAt: Date.now() }),
       phase: "done",
-      txHash: p?.txHash,
+      executionId: p?.executionId,
       updatedAt: Date.now(),
     });
     await saveTaskState(msg.taskId, goal, "done");

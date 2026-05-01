@@ -88,19 +88,21 @@ follow_task() {
           log "🧐 Critic: LLM reasoning — analyzing price impact, sandwich risk, route quality..."
           ;;
         executing)
-          log "⚡ Executor: building swap calldata, submitting via KeeperHub..."
+          log "⚡ Executor: triggering KeeperHub webhook, polling execution status..."
           ;;
         done)
-          local tx_hash
-          tx_hash=$(echo "$status_json" | jq -r '.txHash // "(none)"')
+          local execution_id
+          execution_id=$(echo "$status_json" | jq -r '.executionId // "(none)"')
           echo ""
-          log "✅  Transaction confirmed in ${elapsed}s"
-          echo "    taskId:  ${task_id}"
-          echo "    txHash:  ${tx_hash}"
+          log "✅  Execution confirmed in ${elapsed}s"
+          echo "    taskId:      ${task_id}"
+          echo "    executionId: ${execution_id}"
           echo ""
-          echo "  Chain-of-thought and critique stored in 0G Storage:"
-          echo "    critique:${task_id}"
+          echo "  Audit trail stored in 0G Storage:"
           echo "    plan:${task_id}"
+          echo "    research:${task_id}"
+          echo "    critique:${task_id}"
+          echo "    execution:${task_id}"
           echo "=============================="
           exit 0
           ;;
