@@ -179,8 +179,8 @@ The Planner polls the treasury every `SENTINEL_INTERVAL_MS`. When it detects a b
                             ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                     agent-planner :3001                          │
-│  ● LLM (0G Compute): parse goal → GoalContext                    │
 │  ● Sentinel: monitors treasury wallet on Sepolia                 │
+│  ● LLM (0G Compute): parse goal → GoalContext                    │
 │  ● Writes plan:{taskId} to 0G Storage                            │
 │  ● AXL peer: axl-planner                                         │
 └───────────────────────────┬──────────────────────────────────────┘
