@@ -124,6 +124,8 @@ services:
     environment:
       AXL_NODE_URL: http://axl-researcher:9002
       HEALTH_PORT: "3002"
+    ports:
+      - "3002:3002"
     depends_on:
       axl-researcher:
         condition: service_healthy
@@ -145,6 +147,8 @@ services:
     environment:
       AXL_NODE_URL: http://axl-critic:9002
       HEALTH_PORT: "3003"
+    ports:
+      - "3003:3003"
     depends_on:
       axl-critic:
         condition: service_healthy
@@ -166,6 +170,8 @@ services:
     environment:
       AXL_NODE_URL: http://axl-executor:9002
       HEALTH_PORT: "3004"
+    ports:
+      - "3004:3004"
     depends_on:
       axl-executor:
         condition: service_healthy

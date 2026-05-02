@@ -9,7 +9,8 @@
     "build": "npm run build --workspaces",
     "dev": "npm run dev --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
-    "clean": "npm run clean --workspaces --if-present && rm -rf node_modules"
+    "clean": "npm run clean --workspaces --if-present && rm -rf node_modules",
+    "dashboard": "npm run start --workspace=packages/dashboard"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

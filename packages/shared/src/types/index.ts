@@ -1,7 +1,7 @@
 import { randomUUID } from "crypto";
 
 // ── trading config ────────────────────────────────────────────────────────────
-export const MAX_SLIPPAGE = 1; // percent, e.g. 1 = 1%
+export const MAX_SLIPPAGE = 0.5; // percent, e.g. 0.5 = 0.5%
 
 export type AgentRole = "planner" | "researcher" | "critic" | "executor";
 
@@ -55,15 +55,15 @@ export interface CriticFeedback {
 }
 
 export interface ResearchData {
-  goal:      string;
-  tokenIn:   { symbol: string; address: string; chainId: number };
-  tokenOut:  { symbol: string; address: string; chainId: number };
-  amountIn:  string;
+  goal: string;
+  tokenIn: { symbol: string; address: string; chainId: number };
+  tokenOut: { symbol: string; address: string; chainId: number };
+  amountIn: string;
   amountOut: string;
-  pools:          string[];
-  bestRoute:      string;
-  priceImpact:    string;
-  gasEstimate:    string;
+  pools: string[];
+  bestRoute: string;
+  priceImpact: string;
+  gasEstimate: string;
   gasEstimateUSD?: string;
   fetchedAt: number;
 }

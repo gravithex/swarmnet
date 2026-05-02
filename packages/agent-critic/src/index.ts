@@ -171,6 +171,13 @@ async function handleResearchDone(msg: AgentMessage): Promise<void> {
   if (risks.length > 0) {
     log(AGENT, "info", `Identified risks: ${risks.join(", ")}`, taskId);
   }
+  // Notify planner with critique result for the dashboard.
+  if (PLANNER_PEER_ID) {
+    try {
+      const critiqueStr = `${verdict} ${(confidence * 100).toFixed(0)}% — ${reasoning}`;
+      await axl.sendMessage(PLANNER_PEER_ID, createMessage("critic", "planner", "PROGRESS", { critique: critiqueStr }, taskId));
+    } catch { /* best-effort */ }
+  }
 
   // 3. Persist critique + chain-of-thought to 0G Storage.
   const critique: CritiqueData = {
