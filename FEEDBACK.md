@@ -43,4 +43,4 @@
 
 ### Overall experience
 
-*Fill in at the end of the hackathon*
+Overall a very good experience. The webhook-to-workflow model is intuitive and getting a first execution running was quick — the core integration took less than an hour. The team was reactive on Discord and answered support questions promptly, which made a real difference when hitting undocumented behaviour like the `@<variable>` syntax. The execution status polling API was a highlight: clean, predictable, and exactly the right interface for an autonomous agent that needs to wait for async confirmation. The bugs listed above are real friction points but none of them were blockers once workarounds were found. Would use KeeperHub again.

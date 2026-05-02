@@ -138,6 +138,75 @@ SENTINEL_DEMO_MODE=true ./scripts/demo.sh --sentinel
 
 ---
 
+## Terminal Dashboard
+
+SwarmNet ships a live terminal dashboard that shows agent health, the active task pipeline, and a running event log — all in a single ANSI box updated every 2 seconds.
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│ SwarmNet  DeFi Swarm Monitor   May 02 2026 10:31:04   Sepolia                                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ PLANNER          RESEARCHER        CRITIC            EXECUTOR                                                  │
+│ ● online         ● online          ● online          ● online                                                  │
+│ AXL ok           AXL ok            AXL ok            AXL ok                                                    │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Task  89e27a15…   tasks seen: 1                                                                                 │
+│ Goal:  Swap 75 USDC to WETH with max 0.5% slippage                                                             │
+│                                                                                                                 │
+│   [✓]  PLANNING      done         LLM decomposes goal → structured plan                                        │
+│   [✓]  RESEARCHING   done         Fetching Uniswap quote + token data                                          │
+│   [✓]  CRITIQUING    done         Critic scores confidence (threshold 0.8)                                     │
+│   [~]  EXECUTING     in progress… KeeperHub submits onchain transaction                                        │
+│                                                                                                                 │
+│ ◉  EXECUTING                                                                                                    │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Events                                                                                                          │
+│   10:30:58  new task     89e27a15…  ETH=0.1500 | USDC=150.00 | UNI=10.00                                       │
+│   10:30:58  sentinel     urgency=high — USDC balance of 150 is above threshold                                  │
+│   10:30:59  → research   researcher fetching Uniswap quote                                                      │
+│   10:31:01  → critique   75 USDC→0.043210 WETH | impact=0.12% | gas=$0.41                                      │
+│   10:31:03  → execute    APPROVE 92% — Trade is safe with minimal price impact                                  │
+├────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Refreshing every 2s   Ctrl+C to exit                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**What the dashboard shows:**
+
+| Section | Description |
+|---|---|
+| Agent grid | Online/offline status for each agent process and its AXL node |
+| Task | Active task ID, goal text, and progress through the 4 pipeline phases |
+| Events | Rolling log of key transitions — wallet balance, sentinel decision, Uniswap quote, critic verdict, execution result |
+
+**Running the dashboard:**
+
+```bash
+# Install dependencies (first time only)
+npm install --workspace=packages/dashboard
+
+# Start (agents must already be running)
+npm run start --workspace=packages/dashboard
+```
+
+Or with custom URLs if your agents are on non-default ports:
+
+```bash
+PLANNER_URL=http://localhost:3001 \
+RESEARCHER_URL=http://localhost:3002 \
+CRITIC_URL=http://localhost:3003 \
+EXECUTOR_URL=http://localhost:3004 \
+AXL_PLANNER=http://localhost:8081 \
+AXL_RESEARCHER=http://localhost:8082 \
+AXL_CRITIC=http://localhost:8083 \
+AXL_EXECUTOR=http://localhost:8084 \
+npm run start --workspace=packages/dashboard
+```
+
+The dashboard runs on the **host machine** (not inside Docker) and polls the agent HTTP health endpoints. Make sure ports `3001–3004` and `8081–8084` are exposed in `docker-compose.yml`.
+
+---
+
 ## Demo
 
 > 📹 [Watch the demo video]() *(under 3 mins)*
@@ -252,14 +321,6 @@ The Planner polls the treasury every `SENTINEL_INTERVAL_MS`. When it detects a b
 - **0G Storage SDK** (`@0gfoundation/0g-ts-sdk`) — durable audit trail: plans, critiques, chain-of-thought, execution records
 - **KeeperHub** — onchain execution via workflow webhook; execution status tracked via polling API
 - **Uniswap API** — swap routing, best price discovery, pool data
-
----
-
-## Team
-
-| Name | Role | Contact |
-|---|---|---|
-| [YOUR NAME] | Solo dev | Telegram: @xxx · X: @xxx |
 
 ---
 
